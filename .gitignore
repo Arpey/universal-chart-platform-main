@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+*.log
+.DS_Store
+# 临时/编译产物
+*.tsbuildinfo
+*.d.ts
+# Vue Language Tools 生成的临时 <name>.<ext>.js 文件（例如 App.vue.js、chartStore.js）
+src/**/*.vue.js
+src/**/*.ts.js
+src/**/*.js.js
+.vite/
+
