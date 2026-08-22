@@ -6,15 +6,21 @@ import {
   CrosshairMode,
   CandlestickSeries,
   HistogramSeries,
+  LineSeries,
   type IChartApi,
   type ISeriesApi,
+  type LineData,
+  type LineWidth,
   type UTCTimestamp,
 } from 'lightweight-charts'
 import { CandleCountdownPrimitive } from './CandleCountdownPrimitive'
 import { DrawingPrimitive } from './DrawingPrimitive'
 import DrawingToolbar from './DrawingToolbar.vue'
+import EMASettingsModal from './EMASettingsModal.vue'
 import { useCountdown } from '../composables/useCountdown'
-import { POINT_COUNT, randomColor, FIB_LEVELS, FIBEXT_LEVELS, type DrawKind, type DrawObject, type DrawPoint } from '../types/drawing'
+import { useIndicatorStore } from '../stores/indicatorStore'
+import { calculateEMA } from '../utils/indicators'
+import { POINT_COUNT, randomColor, DEFAULT_FIB_LEVELS, type DrawKind, type DrawObject, type DrawPoint } from '../types/drawing'
 import type { Interval } from '../types'
 
 interface Kline {
@@ -61,6 +67,13 @@ let dragOrigin: DrawPoint | null = null
 let dragStartPoints: DrawPoint[] = []
 let clickHandler: ((param: any) => void) | null = null
 let crosshairHandler: ((param: any) => void) | null = null
+
+// ---------- 技术指标（EMA） ----------
+const indicator = useIndicatorStore()
+const emaSeriesMap = new Map<string, ISeriesApi<'Line'>>()
+const emaLastValues = ref<Record<string, number | null>>({})
+const emaSettingsId = ref<string | null>(null)
+const emaSettingsObj = computed(() => indicator.emaInstances.find((e) => e.id === emaSettingsId.value) ?? null)
 
 const drawings = ref<DrawObject[]>([])
 let raf = 0
@@ -152,6 +165,8 @@ onMounted(async () => {
   applyData(props.data, true)
   lastLen = props.data.length
 
+  syncEmaSeries() // 初始渲染已有指标实例
+
   bindInteraction()
 
   ro = new ResizeObserver(() => {
@@ -168,6 +183,9 @@ onBeforeUnmount(() => {
   if (raf) cancelAnimationFrame(raf)
   window.removeEventListener('resize', handleResize)
   ro?.disconnect()
+  // 清理 EMA 折线系列（chart.removeSeries 为 v5 的移除 API）
+  for (const s of emaSeriesMap.values()) chart?.removeSeries(s)
+  emaSeriesMap.clear()
   if (chart) {
     chart.applyOptions({ handleScroll: { pressedMouseMove: true } }) // 兜底恢复，防止卸载后图表无法拖拽
     if (clickHandler) chart.unsubscribeClick(clickHandler)
@@ -239,6 +257,57 @@ function toVolume(k: Kline) {
     color: toNumber(k.close) >= toNumber(k.open) ? 'rgba(38,166,154,0.6)' : 'rgba(239,83,79,0.6)',
   }
 }
+
+// ---------- EMA 指标：计算 + 渲染 + 生命周期 ----------
+/** 与 store 实例 / K 线数据同步：创建、更新、隐藏、删除 EMA 折线系列。 */
+function syncEmaSeries() {
+  if (!chart) return
+  const data = props.data
+  const desired = new Set<string>()
+  for (const inst of indicator.emaInstances) {
+    desired.add(inst.id)
+    const points = calculateEMA(data, inst.length)
+    const last = points.length ? points[points.length - 1].value : null
+    emaLastValues.value = { ...emaLastValues.value, [inst.id]: last }
+    let s = emaSeriesMap.get(inst.id)
+    if (!s) {
+      s = chart.addSeries(LineSeries, {
+        color: inst.color,
+        lineWidth: inst.lineWidth as LineWidth,
+        priceLineVisible: false,
+        lastValueVisible: false,
+        crosshairMarkerVisible: false,
+        priceScaleId: 'right', // 叠加在 K 线同一价格轴 / 同一 Pane
+      })
+      emaSeriesMap.set(inst.id, s)
+    }
+    s.applyOptions({ color: inst.color, lineWidth: inst.lineWidth as LineWidth, visible: inst.visible })
+    s.setData(points.map((p) => ({ time: toUTCTime(p.time), value: p.value } as LineData)))
+  }
+  // 清理已删除实例对应的折线系列
+  for (const [id, s] of [...emaSeriesMap.entries()]) {
+    if (!desired.has(id)) {
+      chart.removeSeries(s)
+      emaSeriesMap.delete(id)
+      const next = { ...emaLastValues.value }
+      delete next[id]
+      emaLastValues.value = next
+    }
+  }
+}
+
+/** 图例数值格式化（与行情价格一致的小数位）。 */
+function fmtEmaValue(v: number | null | undefined): string {
+  return v == null || !Number.isFinite(v)
+    ? '--'
+    : v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
+
+watch(
+  [() => props.data, () => indicator.emaInstances],
+  () => syncEmaSeries(),
+  { deep: true },
+)
 
 // rAF 节流处理频繁 tick（每 tick 只增量刷新最后一根）
 watch(
@@ -377,8 +446,8 @@ function placePoint(pt: DrawPoint) {
       locked: false,
       zIndex: Date.now(),
       createdAt: Date.now(),
-      // 斐波那契工具：默认勾选标准层级（后续可在悬浮工具栏设置弹窗中勾选预设层级）
-      ...(tool === 'fib' ? { enabledLevels: [...FIB_LEVELS] } : tool === 'fibext' ? { enabledLevels: [...FIBEXT_LEVELS] } : {}),
+      // 斐波那契工具：默认仅勾选核心层级 0/0.5/1/2（其余可在悬浮工具栏设置弹窗中手动勾选预设层级）
+      ...(tool === 'fib' || tool === 'fibext' ? { enabledLevels: [...DEFAULT_FIB_LEVELS] } : {}),
     }
   }
   pendingObj.points.push(pt)
@@ -566,6 +635,23 @@ function genId(): string {
 
 <template>
   <div ref="container" class="tv-chart" :style="{ cursor: containerCursor }">
+    <!-- 左上角指标图例 -->
+    <div v-if="indicator.emaInstances.length" class="ema-legend" @mousedown.stop.prevent @dblclick.stop>
+      <div v-for="inst in indicator.emaInstances" :key="inst.id" class="ema-legend-row">
+        <span class="ema-legend-name" :style="{ color: inst.color }">
+          EMA {{ inst.length }}<em>{{ fmtEmaValue(emaLastValues[inst.id]) }}</em>
+        </span>
+        <button
+          class="ema-legend-btn"
+          :class="{ off: !inst.visible }"
+          :title="inst.visible ? '隐藏指标' : '显示指标'"
+          @click="indicator.toggleVisible(inst.id)"
+        >👁</button>
+        <button class="ema-legend-btn" title="设置" @click="emaSettingsId = inst.id">⚙</button>
+        <button class="ema-legend-btn danger" title="删除指标" @click="indicator.removeEMA(inst.id)">🗑</button>
+      </div>
+    </div>
+
     <DrawingToolbar
       v-if="selectedObj"
       :obj="selectedObj"
@@ -576,6 +662,8 @@ function genId(): string {
       @back="zOrder(false)"
       @close="deselect"
     />
+
+    <EMASettingsModal :open="!!emaSettingsId" :ema="emaSettingsObj" @close="emaSettingsId = null" />
   </div>
 </template>
 
@@ -585,6 +673,66 @@ function genId(): string {
   width: 100%;
   height: 100%;
   min-height: 300px;
+}
+
+/* 左上角 EMA 图例 */
+.ema-legend {
+  position: absolute;
+  top: 6px;
+  left: 8px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  pointer-events: auto;
+  user-select: none;
+}
+.ema-legend-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  background: rgba(15, 20, 25, 0.85);
+  border: 1px solid rgba(33, 150, 243, 0.35);
+  border-radius: 5px;
+  padding: 1px 4px;
+  font-size: 11px;
+}
+.ema-legend-name {
+  font-family: monospace;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.ema-legend-name em {
+  font-style: normal;
+  font-weight: 500;
+  color: #e8edf3;
+  margin-left: 4px;
+}
+.ema-legend-btn {
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 11px;
+  color: #8090a5;
+  padding: 0;
+}
+.ema-legend-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #e8edf3;
+}
+.ema-legend-btn.off {
+  opacity: 0.35;
+}
+.ema-legend-btn.danger:hover {
+  background: rgba(239, 83, 79, 0.2);
+  color: #ef534f;
 }
 </style>
 

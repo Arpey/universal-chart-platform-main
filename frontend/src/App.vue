@@ -4,6 +4,7 @@ import SymbolSearchModal from './components/SymbolSearchModal.vue'
 import Watchlist from './components/Watchlist.vue'
 import TradingChart from './components/TradingChart.vue'
 import StatusBar from './components/StatusBar.vue'
+import IndicatorsModal from './components/IndicatorsModal.vue'
 import { useMarketStore } from './stores/marketStore'
 import { connectMarket } from './services/wsService'
 import { useCountdown } from './composables/useCountdown'
@@ -14,6 +15,7 @@ const lastTimeSec = computed(() => market.klines[market.klines.length - 1]?.time
 const { countdown: candleCountdown } = useCountdown(computed(() => market.interval), lastTimeSec)
 const connected = ref(false)
 const searchOpen = ref(false)
+const indicatorModalOpen = ref(false)
 const activeTool = ref<DrawKind>('cursor')
 const clearSignal = ref(0)
 const toolActive = ref(false)
@@ -63,8 +65,8 @@ const TOOL_HINTS: Partial<Record<DrawKind, string>> = {
   ruler: '测量工具：点击两点拉取区间（ΔP / % / bars / 时长 / ticks）',
   long: '多头持仓：点击入场价 → 点击止盈价（止损自动镜像），三锚点可独立拖拽',
   short: '空头持仓：点击入场价 → 点击止损价（止盈自动镜像），三锚点可独立拖拽',
-  fib: '斐波那契回调：点击 A（趋势起点）→ B（趋势终点），绘制 0–1 层级与色带',
-  fibext: '斐波那契扩展：点击 A → B（主趋势）→ C（回调点），从 C 向右扩展层级',
+  fib: '斐波那契回调：点击 A（趋势起点）→ B（趋势终点），默认 0/0.5/1/2 层级',
+  fibext: '斐波那契扩展：点击 A → B（主趋势）→ C（回调点），第 3 点完成后生成扩展线',
 }
 
 function onDrawingDone() {
@@ -119,6 +121,9 @@ function formatPrice(value?: number) {
             @click="market.interval = item"
           >{{ item }}</button>
         </div>
+        <button class="ind-btn" title="指标（Indicators）" @click="indicatorModalOpen = true">
+          <span class="ind-fx">ƒx</span>
+        </button>
         <span class="candle-countdown" title="距下一根 K 线开盘">⏱ {{ candleCountdown }}</span>
         <span v-if="market.ticker" class="last-price" :class="market.ticker.change24h >= 0 ? 'up' : 'down'">
           {{ formatPrice(market.ticker.price) }}
@@ -179,6 +184,7 @@ function formatPrice(value?: number) {
 
     <StatusBar :connected="connected" :count="market.klines.length" />
     <SymbolSearchModal v-model:open="searchOpen" />
+    <IndicatorsModal :open="indicatorModalOpen" @close="indicatorModalOpen = false" />
   </main>
 </template>
 
@@ -243,6 +249,35 @@ function formatPrice(value?: number) {
 }
 .periods button:hover { color: var(--color-text); border-color: var(--color-border); }
 .periods button.active { background: #3b82f6; color: #fff; }
+
+/* 指标（Indicators）按钮 */
+.ind-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 26px;
+  padding: 0 9px;
+  margin-left: 2px;
+  flex-shrink: 0;
+  background: transparent;
+  color: var(--color-text-muted);
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.ind-btn:hover {
+  color: var(--color-text);
+  border-color: #3b82f6;
+  background: rgba(59, 130, 246, 0.1);
+}
+.ind-fx {
+  font-family: monospace;
+  font-weight: 800;
+  font-size: 12px;
+  letter-spacing: 0;
+}
 
 .candle-countdown {
   font-family: monospace;

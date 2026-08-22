@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import type { DrawObject, LineStyle } from '../types/drawing'
-import { FIB_LEVEL_PRESETS, FIBEXT_LEVEL_PRESETS, FIB_LEVELS, FIBEXT_LEVELS } from '../types/drawing'
+import { FIB_LEVEL_PRESETS, FIBEXT_LEVEL_PRESETS, DEFAULT_FIB_LEVELS } from '../types/drawing'
 
 const props = defineProps<{
   obj: DrawObject
@@ -29,7 +29,7 @@ const LINE_STYLES: { key: LineStyle; label: string; title: string }[] = [
 // ---- 斐波那契层级勾选 ----
 const isFib = computed(() => props.obj.kind === 'fib' || props.obj.kind === 'fibext')
 const fibPresets = computed(() => (props.obj.kind === 'fibext' ? FIBEXT_LEVEL_PRESETS : FIB_LEVEL_PRESETS))
-const fibDefaults = computed(() => (props.obj.kind === 'fibext' ? FIBEXT_LEVELS : FIB_LEVELS))
+const fibDefaults = computed(() => DEFAULT_FIB_LEVELS)
 
 function levelEnabled(lv: number): boolean {
   const cur = props.obj.enabledLevels

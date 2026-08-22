@@ -42,16 +42,14 @@ export const POINT_COUNT: Record<Exclude<DrawKind, 'cursor'>, number> = {
   fibext: 3,
 }
 
-/** 斐波那契回调默认层级 */
-export const FIB_LEVELS = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0]
+/** 斐波那契回调/扩展首次绘制的默认勾选层级（0 / 0.5 / 1 / 2 四个核心档位，其余可在设置弹窗中手动勾选） */
+export const DEFAULT_FIB_LEVELS = [0, 0.5, 1, 2]
 /** 斐波那契回调可选扩展层级 */
 export const FIB_EXT_LEVELS = [1.618, 2.618, 4.236, -0.236, -0.618]
-/** 趋势型斐波那契扩展层级 */
-export const FIBEXT_LEVELS = [0, 0.382, 0.618, 1.0, 1.272, 1.618, 2.0, 2.618]
 
-/** 斐波那契回调预设常用层级（设置弹窗 Checkbox 列表，默认勾选 FIB_LEVELS） */
+/** 斐波那契回调预设常用层级（设置弹窗 Checkbox 列表，默认勾选 DEFAULT_FIB_LEVELS） */
 export const FIB_LEVEL_PRESETS = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0, 1.272, 1.618, 2.618]
-/** 趋势型斐波那契扩展预设常用层级（设置弹窗 Checkbox 列表，默认勾选 FIBEXT_LEVELS） */
+/** 趋势型斐波那契扩展预设常用层级（设置弹窗 Checkbox 列表，默认勾选 DEFAULT_FIB_LEVELS） */
 export const FIBEXT_LEVEL_PRESETS = [0, 0.382, 0.618, 1.0, 1.272, 1.618, 2.0, 2.618, 3.618, 4.236]
 
 const PALETTE = ['#ffd166', '#4cc9f0', '#f72585', '#7ae582', '#9d4edd', '#ff6b6b', '#48bfe3', '#3b82f6']

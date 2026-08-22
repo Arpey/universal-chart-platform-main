@@ -10,7 +10,7 @@ import type {
   ISeriesPrimitiveAxisView,
 } from 'lightweight-charts'
 import type { DrawObject, DrawPoint, DrawKind, LineStyle } from '../types/drawing'
-import { FIB_LEVELS, FIBEXT_LEVELS } from '../types/drawing'
+import { DEFAULT_FIB_LEVELS } from '../types/drawing'
 
 /** 原始 K 线（供标尺计算 bars/成交量） */
 interface Kline { time: number; open: number; high: number; low: number; close: number; volume: number }
@@ -343,7 +343,7 @@ export class DrawingPrimitive implements ISeriesPrimitive<Time> {
     return false
   }
 
-  /** 斐波那契回调线体命中：任一勾选启用的层级水平线。 */
+  /** 斐波那契回调线体命中：A↔B 锚点有限区间内的任一勾选启用的层级水平线。 */
   private hitFib(obj: DrawObject, x: number, y: number, r: number): boolean {
     const [a, b] = obj.points
     if (!a || !b) return false
@@ -351,25 +351,41 @@ export class DrawingPrimitive implements ISeriesPrimitive<Time> {
     const xB = this.timeToX(b.time)
     if (xA == null || xB == null) return false
     const x0 = Math.min(xA, xB)
+    const x1 = Math.max(xA, xB)
     for (const lv of this.fibEnabled(obj)) {
       const y0 = this.priceToY(a.price + (b.price - a.price) * lv)
       if (y0 == null) continue
-      if (x >= x0 - r && Math.abs(y - y0) <= r) return true
+      if (x >= x0 - r && x <= x1 + r && Math.abs(y - y0) <= r) return true
     }
     return false
   }
 
-  /** 趋势型斐波那契扩展线体命中：从 C 向右的任一勾选启用的扩展层级水平线。 */
+  /** 趋势型斐波那契扩展线体命中：A→B 主趋势线段 + B→C 回调腿 + C 向右有限扩展区内的任一勾选层级水平线。 */
   private hitFibExt(obj: DrawObject, x: number, y: number, r: number): boolean {
     const [a, b, c] = obj.points
-    if (!a || !b || !c) return false
-    const x0 = this.timeToX(c.time)
-    if (x0 == null) return false
+    if (!a || !b) return false
+    const xA = this.timeToX(a.time)
+    const yA = this.priceToY(a.price)
+    const xB = this.timeToX(b.time)
+    const yB = this.priceToY(b.price)
+    if (xA == null || xB == null || yA == null || yB == null) return false
+    // A→B 主趋势线段命中
+    if (this.distToSegment(x, y, xA, yA, xB, yB) <= r) return true
+    // 第 3 点 C 未确定前（绘制过程）不参与命中
+    if (!c) return false
+    const xC = this.timeToX(c.time)
+    const yC = this.priceToY(c.price)
+    if (xC == null || yC == null) return false
+    // B→C 回调腿命中
+    if (this.distToSegment(x, y, xB, yB, xC, yC) <= r) return true
+    // 扩展区：从 C 向右一个 AB 跨度（钳制到画布右缘），水平层级线命中
+    const span = Math.max(xB - xA, 24)
+    const xR = Math.min(xC + span, this._lastW || xC + span)
     const range = b.price - a.price
     for (const lv of this.fibEnabled(obj)) {
       const y0 = this.priceToY(c.price + range * lv)
       if (y0 == null) continue
-      if (x >= x0 - r && Math.abs(y - y0) <= r) return true
+      if (x >= xC - r && x <= xR + r && Math.abs(y - y0) <= r) return true
     }
     return false
   }
@@ -528,10 +544,10 @@ export class DrawingPrimitive implements ISeriesPrimitive<Time> {
     return { entry: p0, tp, sl }
   }
 
-  /** 斐波那契对象当前勾选启用的层级（无勾选记录时回退默认层级）。 */
+  /** 斐波那契对象当前勾选启用的层级（无勾选记录时回退默认核心层级 0/0.5/1/2）。 */
   private fibEnabled(obj: DrawObject): number[] {
     if (obj.enabledLevels && obj.enabledLevels.length) return obj.enabledLevels
-    return obj.kind === 'fibext' ? FIBEXT_LEVELS : FIB_LEVELS
+    return DEFAULT_FIB_LEVELS
   }
 
   /** 持仓工具渲染：有限宽度双色遮罩矩形（TP 恒绿 / SL 恒红）+ 三条水平价位线 + 矩形边框 + 价格标签 + R:R Badge。 */
@@ -642,7 +658,7 @@ export class DrawingPrimitive implements ISeriesPrimitive<Time> {
 
   // ---------- 斐波那契回调（fib） ----------
 
-  /** 斐波那契回调：A→B 确定趋势，仅绘制勾选启用的层级 + 相邻层级交替半透明色带 + 右缘「比例 (价格)」标签。 */
+  /** 斐波那契回调：A→B 确定趋势，仅绘制勾选启用的层级 + 相邻层级交替半透明色带 + 有限线段（只横跨 A↔B 锚点区间）。 */
   private drawFib(ctx: CanvasRenderingContext2D, obj: DrawObject, w: number, _h: number, draft: boolean) {
     const [a, b] = obj.points
     if (!a || !b) return
@@ -650,34 +666,38 @@ export class DrawingPrimitive implements ISeriesPrimitive<Time> {
     const xB = this.timeToX(b.time)
     if (xA == null || xB == null) return
     const x0 = Math.min(xA, xB)
+    const x1 = Math.max(xA, xB)
+    if (x1 - x0 < 1) return
     const dec = priceDecimals(a.price)
     const levels = this.fibEnabled(obj)
     const prices = levels.map((lv) => a.price + (b.price - a.price) * lv)
     ctx.save()
-    // 相邻已勾选层级间交替半透明色带
+    // 相邻已勾选层级间交替半透明色带（有限区间 [x0, x1]）
     for (let i = 0; i < levels.length - 1; i++) {
       const y1 = this.priceToY(prices[i])
       const y2 = this.priceToY(prices[i + 1])
       if (y1 == null || y2 == null) continue
       ctx.fillStyle = hexToRgba(obj.color, i % 2 === 0 ? 0.12 : 0.24)
-      ctx.fillRect(x0, Math.min(y1, y2), w - x0, Math.abs(y1 - y2))
+      ctx.fillRect(x0, Math.min(y1, y2), x1 - x0, Math.abs(y1 - y2))
     }
-    // 已勾选层级水平线 + 右缘标签
+    // 已勾选层级水平线（有限线段）+ 右缘标签
     for (let i = 0; i < levels.length; i++) {
       const y = this.priceToY(prices[i])
       if (y == null) continue
       ctx.strokeStyle = hexToRgba(obj.color, draft ? 0.7 : 0.95)
       ctx.lineWidth = i === 0 || i === levels.length - 1 ? 1.5 : 1
       this.applyLineStyle(ctx, draft ? 'dashed' : 'solid')
-      ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(w, y); ctx.stroke()
-      this.drawRightLabel(ctx, `${fmtLevel(levels[i])} (${fmtPrice(prices[i], dec)})`, hexToRgba(obj.color, 1), y, w, w)
+      ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke()
+      this.drawRightLabel(ctx, `${fmtLevel(levels[i])} (${fmtPrice(prices[i], dec)})`, hexToRgba(obj.color, 1), y, x1, w)
     }
     ctx.restore()
   }
 
   // ---------- 趋势型斐波那契扩展（fibext） ----------
 
-  /** 趋势型斐波那契扩展：A→B 主趋势 + C 回调点，从 C 向右绘制勾选启用的扩展层级（C 未定时渲染 A→B 引导虚线）。 */
+  /** 趋势型斐波那契扩展：三点交互（A→B 主趋势 + C 回调点，第 3 点确认后才完成）。
+   *  Target = P_C + (P_B − P_A) × Level；从 C 向右绘制「一个 AB 跨度」的有限扩展区（钳制画布右缘）。
+   *  绘制过程（C 未定时）：实时预览 A→B 引导 + 随鼠标移动的扩展线草稿。 */
   private drawFibExt(ctx: CanvasRenderingContext2D, obj: DrawObject, w: number, _h: number, draft: boolean) {
     const [a, b, c] = obj.points
     if (!a || !b) return
@@ -687,17 +707,32 @@ export class DrawingPrimitive implements ISeriesPrimitive<Time> {
     const yB = this.priceToY(b.price)
     if (xA == null || xB == null || yA == null || yB == null) return
     ctx.save()
-    // A→B 主趋势引导线
+    // A→B 主趋势线段（有限线段，不向两侧延伸）
     ctx.strokeStyle = hexToRgba(obj.color, 0.75)
     ctx.lineWidth = 1
     this.applyLineStyle(ctx, draft ? 'dashed' : obj.lineStyle)
     ctx.beginPath(); ctx.moveTo(xA, yA); ctx.lineTo(xB, yB); ctx.stroke()
+    // C 未定时（第 1~2 点绘制/预览阶段）：仅渲染 A→B 引导线
     if (!c) {
       ctx.restore()
       return
     }
     const xC = this.timeToX(c.time)
-    if (xC == null) {
+    const yC = this.priceToY(c.price)
+    if (xC == null || yC == null) {
+      ctx.restore()
+      return
+    }
+    // B→C 回调腿（有限线段，虚线）
+    ctx.strokeStyle = hexToRgba(obj.color, 0.45)
+    ctx.lineWidth = 1
+    ctx.setLineDash([4, 4])
+    ctx.beginPath(); ctx.moveTo(xB, yB); ctx.lineTo(xC, yC); ctx.stroke()
+    ctx.setLineDash([])
+    // 有限扩展区：从 C 向右一个 AB 跨度（钳制到画布右缘），避免贯穿全屏
+    const span = Math.max(xB - xA, 24)
+    const xR = Math.min(xC + span, w)
+    if (xR - xC < 1) {
       ctx.restore()
       return
     }
@@ -705,23 +740,23 @@ export class DrawingPrimitive implements ISeriesPrimitive<Time> {
     const dec = priceDecimals(c.price)
     const levels = this.fibEnabled(obj)
     const prices = levels.map((lv) => c.price + range * lv)
-    // 相邻已勾选层级间交替半透明色带
+    // 相邻已勾选层级间交替半透明色带（扩展区 [xC, xR]）
     for (let i = 0; i < levels.length - 1; i++) {
       const y1 = this.priceToY(prices[i])
       const y2 = this.priceToY(prices[i + 1])
       if (y1 == null || y2 == null) continue
       ctx.fillStyle = hexToRgba(obj.color, i % 2 === 0 ? 0.1 : 0.22)
-      ctx.fillRect(xC, Math.min(y1, y2), w - xC, Math.abs(y1 - y2))
+      ctx.fillRect(xC, Math.min(y1, y2), xR - xC, Math.abs(y1 - y2))
     }
-    // 已勾选层级水平线 + 右缘标签
+    // 已勾选层级水平线（有限线段）+ 右缘标签
     for (let i = 0; i < levels.length; i++) {
       const y = this.priceToY(prices[i])
       if (y == null) continue
       ctx.strokeStyle = hexToRgba(obj.color, draft ? 0.7 : 0.95)
       ctx.lineWidth = levels[i] === 1 ? 1.5 : 1
       this.applyLineStyle(ctx, draft ? 'dashed' : 'solid')
-      ctx.beginPath(); ctx.moveTo(xC, y); ctx.lineTo(w, y); ctx.stroke()
-      this.drawRightLabel(ctx, `${fmtLevel(levels[i])} (${fmtPrice(prices[i], dec)})`, hexToRgba(obj.color, 1), y, w, w)
+      ctx.beginPath(); ctx.moveTo(xC, y); ctx.lineTo(xR, y); ctx.stroke()
+      this.drawRightLabel(ctx, `${fmtLevel(levels[i])} (${fmtPrice(prices[i], dec)})`, hexToRgba(obj.color, 1), y, xR, w)
     }
     ctx.restore()
   }
