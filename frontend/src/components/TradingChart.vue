@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   createChart,
   ColorType,
@@ -17,6 +17,9 @@ import {
   type DrawObject,
   type DrawPoint,
 } from './LineDrawingPrimitive'
+import { CandleCountdownPrimitive } from './CandleCountdownPrimitive'
+import { useCountdown } from '../composables/useCountdown'
+import type { Interval } from '../types'
 
 interface Kline {
   time: number
@@ -29,6 +32,7 @@ interface Kline {
 
 const props = defineProps<{
   data: Kline[]
+  interval: Interval
   activeTool?: DrawKind
   clearSignal?: number
 }>()
@@ -42,6 +46,7 @@ let chart: IChartApi | null = null
 let candleSeries: ISeriesApi<'Candlestick'> | null = null
 let volumeSeries: ISeriesApi<'Histogram'> | null = null
 let primitive: LineDrawingPrimitive | null = null
+let countdownPrimitive: CandleCountdownPrimitive | null = null
 
 const drawings = ref<DrawObject[]>([])
 let raf = 0
@@ -50,6 +55,17 @@ let lastLen = 0
 let lastFirstTime = 0
 let disposed = false
 let ro: ResizeObserver | null = null
+
+// ---------- K 线收盘倒计时 ----------
+const lastTimeSec = computed(() => props.data[props.data.length - 1]?.time)
+const lastClose = computed(() => props.data[props.data.length - 1]?.close ?? 0)
+const { countdown } = useCountdown(computed(() => props.interval), lastTimeSec)
+
+watch([countdown, lastClose], () => {
+  if (countdownPrimitive) {
+    countdownPrimitive.setValue(lastClose.value, countdown.value)
+  }
+})
 
 onMounted(async () => {
   if (!container.value) return
@@ -102,6 +118,11 @@ onMounted(async () => {
 
   primitive = new LineDrawingPrimitive()
   candleSeries.attachPrimitive(primitive)
+
+  // K 线收盘倒计时徽标（叠加层）
+  countdownPrimitive = new CandleCountdownPrimitive()
+  candleSeries.attachPrimitive(countdownPrimitive)
+  countdownPrimitive.setValue(lastClose.value, countdown.value)
 
   applyData(props.data, true)
   lastLen = props.data.length

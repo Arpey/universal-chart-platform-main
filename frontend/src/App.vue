@@ -1,13 +1,17 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import SymbolSearch from './components/SymbolSearch.vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import SymbolSearchModal from './components/SymbolSearchModal.vue'
+import Watchlist from './components/Watchlist.vue'
 import TradingChart from './components/TradingChart.vue'
 import StatusBar from './components/StatusBar.vue'
 import { useMarketStore } from './stores/marketStore'
 import { connectMarket } from './services/wsService'
+import { useCountdown } from './composables/useCountdown'
 import type { DrawKind } from './components/LineDrawingPrimitive'
 
 const market = useMarketStore()
+const lastTimeSec = computed(() => market.klines[market.klines.length - 1]?.time)
+const { countdown: candleCountdown } = useCountdown(computed(() => market.interval), lastTimeSec)
 const connected = ref(false)
 const searchOpen = ref(false)
 const activeTool = ref<DrawKind>('cursor')
@@ -69,6 +73,7 @@ function formatPrice(value?: number) {
             @click="market.interval = item"
           >{{ item }}</button>
         </div>
+        <span class="candle-countdown" title="距下一根 K 线开盘">⏱ {{ candleCountdown }}</span>
         <span v-if="market.ticker" class="last-price" :class="market.ticker.change24h >= 0 ? 'up' : 'down'">
           {{ formatPrice(market.ticker.price) }}
         </span>
@@ -106,15 +111,17 @@ function formatPrice(value?: number) {
         </div>
         <TradingChart
           :data="market.klines"
+          :interval="market.interval"
           :active-tool="activeTool"
           :clear-signal="clearSignal"
           @tool-state="toolActive = $event"
         />
       </div>
+      <Watchlist />
     </section>
 
     <StatusBar :connected="connected" :count="market.klines.length" />
-    <SymbolSearch v-model:open="searchOpen" />
+    <SymbolSearchModal v-model:open="searchOpen" />
   </main>
 </template>
 
@@ -179,6 +186,18 @@ function formatPrice(value?: number) {
 }
 .periods button:hover { color: var(--color-text); border-color: var(--color-border); }
 .periods button.active { background: #3b82f6; color: #fff; }
+
+.candle-countdown {
+  font-family: monospace;
+  font-size: 12px;
+  font-weight: 600;
+  color: #7dd3fc;
+  background: rgba(59, 130, 246, 0.12);
+  border: 1px solid rgba(59, 130, 246, 0.3);
+  border-radius: 5px;
+  padding: 3px 8px;
+  white-space: nowrap;
+}
 
 .last-price { font-family: monospace; font-size: 14px; font-weight: 600; }
 .chg { font-family: monospace; font-size: 12px; }
