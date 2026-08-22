@@ -7,7 +7,7 @@ import StatusBar from './components/StatusBar.vue'
 import { useMarketStore } from './stores/marketStore'
 import { connectMarket } from './services/wsService'
 import { useCountdown } from './composables/useCountdown'
-import type { DrawKind } from './components/LineDrawingPrimitive'
+import type { DrawKind } from './types/drawing'
 
 const market = useMarketStore()
 const lastTimeSec = computed(() => market.klines[market.klines.length - 1]?.time)
@@ -19,14 +19,60 @@ const clearSignal = ref(0)
 const toolActive = ref(false)
 let disconnect = () => {}
 
-const TOOLS: { key: DrawKind; icon: string; title: string }[] = [
-  { key: 'cursor', icon: '⛨', title: '光标/选择' },
-  { key: 'trend', icon: '╱', title: '趋势线' },
-  { key: 'ray', icon: '➤', title: '射线' },
-  { key: 'hline', icon: '─', title: '水平线' },
-  { key: 'vline', icon: '│', title: '垂直线' },
-  { key: 'fib', icon: '⌗', title: '斐波那契回撤' },
+const DRAW_GROUPS: { title: string; items: { key: DrawKind; icon: string; title: string }[] }[] = [
+  { title: '选择', items: [{ key: 'cursor', icon: '🖱', title: '光标/选择' }] },
+  {
+    title: '趋势线',
+    items: [
+      { key: 'trend', icon: '╱', title: '趋势线（线段，两点）' },
+      { key: 'ray', icon: '➤', title: '射线（两点，向右延伸）' },
+      { key: 'hray', icon: '─', title: '水平射线（单点，向右延伸）' },
+    ],
+  },
+  {
+    title: '测量',
+    items: [
+      { key: 'vline', icon: '│', title: '垂直线（单点）' },
+      { key: 'ruler', icon: '▭', title: '测量工具（两点）' },
+    ],
+  },
+  {
+    title: '持仓',
+    items: [
+      { key: 'long', icon: '▲', title: '多头持仓（两点：入场 → 止盈，止损自动镜像，三锚点可拖）' },
+      { key: 'short', icon: '▼', title: '空头持仓（两点：入场 → 止损，止盈自动镜像，三锚点可拖）' },
+    ],
+  },
+  {
+    title: '斐波那契',
+    items: [
+      { key: 'fib', icon: 'ƒ', title: '斐波那契回调（两点：趋势起点 A → 终点 B）' },
+      { key: 'fibext', icon: '⇗', title: '趋势型斐波那契扩展（三点：A → B → C 回调点）' },
+    ],
+  },
 ]
+
+const magnet = ref(false)
+const stayInMode = ref(false)
+
+const TOOL_HINTS: Partial<Record<DrawKind, string>> = {
+  trend: '趋势线：点击 A → B，绘制有限线段（不延伸）',
+  ray: '射线：点击 A 点 → B 点，向右侧无限延伸',
+  hray: '水平射线：单击放置，从该点向右水平延伸',
+  vline: '垂直线：单击放置时间标记',
+  ruler: '测量工具：点击两点拉取区间（ΔP / % / bars / 时长 / ticks）',
+  long: '多头持仓：点击入场价 → 点击止盈价（止损自动镜像），三锚点可独立拖拽',
+  short: '空头持仓：点击入场价 → 点击止损价（止盈自动镜像），三锚点可独立拖拽',
+  fib: '斐波那契回调：点击 A（趋势起点）→ B（趋势终点），绘制 0–1 层级与色带',
+  fibext: '斐波那契扩展：点击 A → B（主趋势）→ C（回调点），从 C 向右扩展层级',
+}
+
+function onDrawingDone() {
+  if (!stayInMode.value) {
+    activeTool.value = 'cursor'
+    toolActive.value = false
+  }
+}
 
 function pickTool(key: DrawKind) {
   activeTool.value = activeTool.value === key ? 'cursor' : key
@@ -90,14 +136,22 @@ function formatPrice(value?: number) {
     <section class="workspace">
       <!-- 左侧画线工具栏 -->
       <aside class="toolbar">
-        <button
-          v-for="t in TOOLS"
-          :key="t.key"
-          class="tool"
-          :class="{ active: activeTool === t.key, engaged: toolActive && !['cursor'].includes(t.key) && activeTool === t.key }"
-          :title="t.title"
-          @click="pickTool(t.key)"
-        ><span class="tool-icon">{{ t.icon }}</span></button>
+        <template v-for="(group, gi) in DRAW_GROUPS" :key="group.title">
+          <span class="tool-group-title">{{ group.title }}</span>
+          <button
+            v-for="t in group.items"
+            :key="t.key"
+            class="tool"
+            :class="{ active: activeTool === t.key }"
+            :title="t.title"
+            @click="pickTool(t.key)"
+          ><span class="tool-icon">{{ t.icon }}</span></button>
+          <span v-if="gi < DRAW_GROUPS.length - 1" class="tool-sep"></span>
+        </template>
+
+        <span class="tool-sep"></span>
+        <button class="tool" :class="{ active: magnet }" title="磁吸模式（Ctrl/Cmd 可临时启用）" @click="magnet = !magnet">🧲</button>
+        <button class="tool" :class="{ active: stayInMode }" title="连续绘制模式（画完保持当前工具）" @click="stayInMode = !stayInMode">🔁</button>
         <button class="tool danger" title="清除全部画线" @click="clearDrawings">✕</button>
       </aside>
 
@@ -107,14 +161,17 @@ function formatPrice(value?: number) {
           ⚠️ {{ market.error }}。请确认后端已启动或检查网络/代理配置。
         </div>
         <div v-if="toolActive" class="tool-hint">
-          点击图表放置：{{ activeTool === 'trend' ? '趋势线(两点)' : activeTool === 'ray' ? '射线(两点)' : activeTool === 'fib' ? '斐波那契(两点)' : '水平/垂直线(单点)' }} · 双击锚点删除
+          {{ TOOL_HINTS[activeTool] ?? '点击图表开始绘制' }} · 双击锚点删除 · Esc 取消
         </div>
         <TradingChart
           :data="market.klines"
           :interval="market.interval"
           :active-tool="activeTool"
+          :magnet="magnet"
+          :stay-in-mode="stayInMode"
           :clear-signal="clearSignal"
           @tool-state="toolActive = $event"
+          @drawing-done="onDrawingDone"
         />
       </div>
       <Watchlist />
@@ -220,10 +277,18 @@ function formatPrice(value?: number) {
 /* 左侧画线工具栏 */
 .toolbar {
   display: flex; flex-direction: column; align-items: center; gap: 2px;
-  width: 40px; flex-shrink: 0;
+  width: 48px; flex-shrink: 0;
   padding: 6px 0;
   background: var(--color-bg-secondary);
   border-right: 1px solid var(--color-border);
+  overflow-y: auto;
+}
+.tool-group-title {
+  font-size: 9px; font-weight: 700; letter-spacing: 0.4px; text-transform: uppercase;
+  color: #5b6470; padding: 6px 0 2px; user-select: none;
+}
+.tool-sep {
+  width: 24px; height: 1px; margin: 4px 0; background: var(--color-border);
 }
 .tool {
   width: 32px; height: 32px; display: inline-flex; align-items: center; justify-content: center;

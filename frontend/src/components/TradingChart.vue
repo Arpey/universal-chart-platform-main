@@ -10,15 +10,11 @@ import {
   type ISeriesApi,
   type UTCTimestamp,
 } from 'lightweight-charts'
-import {
-  LineDrawingPrimitive,
-  randomColor,
-  type DrawKind,
-  type DrawObject,
-  type DrawPoint,
-} from './LineDrawingPrimitive'
 import { CandleCountdownPrimitive } from './CandleCountdownPrimitive'
+import { DrawingPrimitive } from './DrawingPrimitive'
+import DrawingToolbar from './DrawingToolbar.vue'
 import { useCountdown } from '../composables/useCountdown'
+import { POINT_COUNT, randomColor, FIB_LEVELS, FIBEXT_LEVELS, type DrawKind, type DrawObject, type DrawPoint } from '../types/drawing'
 import type { Interval } from '../types'
 
 interface Kline {
@@ -34,19 +30,37 @@ const props = defineProps<{
   data: Kline[]
   interval: Interval
   activeTool?: DrawKind
+  magnet?: boolean
+  stayInMode?: boolean
   clearSignal?: number
 }>()
 
 const emit = defineEmits<{
   toolState: [active: boolean]
+  drawingDone: []
 }>()
 
 const container = ref<HTMLElement>()
 let chart: IChartApi | null = null
 let candleSeries: ISeriesApi<'Candlestick'> | null = null
 let volumeSeries: ISeriesApi<'Histogram'> | null = null
-let primitive: LineDrawingPrimitive | null = null
+let primitive: DrawingPrimitive | null = null
 let countdownPrimitive: CandleCountdownPrimitive | null = null
+
+// ---------- 画线交互状态（FSM: idle → placing → selected/dragging） ----------
+const mode = ref<'idle' | 'placing' | 'dragging'>('idle')
+const selectedId = ref<string | null>(null)
+const toolbarPos = ref<{ left: number; top: number } | null>(null)
+const hoverState = ref<'anchor' | 'body' | null>(null)
+const magnetHeld = ref(false)
+let pendingObj: DrawObject | null = null
+let previewPoint: DrawPoint | null = null
+let dragId: string | null = null
+let dragIndex: number | null = null
+let dragOrigin: DrawPoint | null = null
+let dragStartPoints: DrawPoint[] = []
+let clickHandler: ((param: any) => void) | null = null
+let crosshairHandler: ((param: any) => void) | null = null
 
 const drawings = ref<DrawObject[]>([])
 let raf = 0
@@ -65,6 +79,16 @@ watch([countdown, lastClose], () => {
   if (countdownPrimitive) {
     countdownPrimitive.setValue(lastClose.value, countdown.value)
   }
+})
+
+// 选中对象 / 磁吸开关 / 容器光标反馈
+const selectedObj = computed(() => drawings.value.find((d) => d.id === selectedId.value) ?? null)
+const magnetActive = computed(() => !!props.magnet || magnetHeld.value)
+const containerCursor = computed(() => {
+  if (mode.value === 'dragging') return 'grabbing'
+  if (hoverState.value) return 'grab'
+  if (currentTool() !== 'cursor') return 'crosshair'
+  return 'default'
 })
 
 onMounted(async () => {
@@ -116,8 +140,9 @@ onMounted(async () => {
   })
   chart.priceScale('volume').applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } })
 
-  primitive = new LineDrawingPrimitive()
+  primitive = new DrawingPrimitive()
   candleSeries.attachPrimitive(primitive)
+  primitive.setKlines(props.data)
 
   // K 线收盘倒计时徽标（叠加层）
   countdownPrimitive = new CandleCountdownPrimitive()
@@ -144,6 +169,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('resize', handleResize)
   ro?.disconnect()
   if (chart) {
+    chart.applyOptions({ handleScroll: { pressedMouseMove: true } }) // 兜底恢复，防止卸载后图表无法拖拽
     if (clickHandler) chart.unsubscribeClick(clickHandler)
     if (crosshairHandler) chart.unsubscribeCrosshairMove(crosshairHandler)
     chart.remove()
@@ -151,6 +177,8 @@ onBeforeUnmount(() => {
   }
   document.removeEventListener('mousemove', handleDocMove)
   document.removeEventListener('mouseup', handleMouseUp)
+  window.removeEventListener('keydown', onKeydown)
+  window.removeEventListener('keyup', onKeyup)
   candleSeries = null
   volumeSeries = null
   primitive = null
@@ -215,14 +243,20 @@ function toVolume(k: Kline) {
 // rAF 节流处理频繁 tick（每 tick 只增量刷新最后一根）
 watch(
   () => props.data,
-  () => {
+  (nv, ov) => {
     if (disposed) return
+    if (nv !== ov) {
+      // 切换标的/周期：清空未完成绘制状态与选区
+      cancelPending()
+      deselect()
+    }
+    primitive?.setKlines(nv)
     if (renderPending) return
     renderPending = true
     raf = requestAnimationFrame(() => {
       renderPending = false
       applyData(props.data, false)
-      primitive?.setObjects(drawings.value)
+      primitive?.setObjects(drawings.value, selectedId.value)
     })
   },
   { deep: true },
@@ -231,28 +265,34 @@ watch(
 watch(
   () => [props.activeTool, props.clearSignal],
   () => {
-    if (props.clearSignal && props.clearSignal > 0) drawings.value = []
-    primitive?.setObjects(drawings.value)
+    if (props.clearSignal && props.clearSignal > 0) {
+      drawings.value = []
+      deselect()
+    } else {
+      cancelPending()
+    }
+    primitive?.setObjects(drawings.value, selectedId.value)
   },
 )
 
-// ---------- 画线工具交互 ----------
-let mode: 'idle' | 'placing' | 'dragging' = 'idle'
-let pendingObj: DrawObject | null = null
-let dragId: string | null = null
-let dragAnchorIndex = 0
-let clickHandler: ((param: any) => void) | null = null
-let crosshairHandler: ((param: any) => void) | null = null
+// ---------- 画线工具交互（FSM: idle → placing → selected/dragging） ----------
+function isDrawingTool(tool: DrawKind): tool is Exclude<DrawKind, 'cursor'> {
+  return tool !== 'cursor'
+}
+
+function currentTool(): DrawKind {
+  return props.activeTool ?? 'cursor'
+}
 
 function bindInteraction() {
   if (!chart) return
   clickHandler = (param) => {
-    if (disposed || !param.point || !param.time) return
-    handleClick(param.point.x, param.point.y)
+    if (disposed || !param.point) return
+    onChartClick(param.point.x, param.point.y)
   }
   crosshairHandler = (param) => {
     if (disposed || !param.point) return
-    handleMove(param.point.x, param.point.y)
+    onChartMove(param.point.x, param.point.y)
   }
   chart.subscribeClick(clickHandler)
   chart.subscribeCrosshairMove(crosshairHandler)
@@ -263,99 +303,259 @@ function bindInteraction() {
   }
   document.addEventListener('mousemove', handleDocMove)
   document.addEventListener('mouseup', handleMouseUp)
+  window.addEventListener('keydown', onKeydown)
+  window.addEventListener('keyup', onKeyup)
 }
 
-function currentTool(): DrawKind {
-  return props.activeTool ?? 'cursor'
-}
-
-function handleClick(x: number, y: number) {
-  const tool = currentTool()
-  if (tool === 'cursor') return
-  const pt = primitive?.screenToPoint(x, y)
-  if (!pt) return
-
-  if (mode === 'placing' && pendingObj) {
-    pendingObj.points.push(pt)
-    drawings.value = [...drawings.value, pendingObj]
-    pendingObj = null
-    mode = 'idle'
-    emit('toolState', false)
-    primitive?.setObjects(drawings.value)
-    return
-  }
-
-  if (tool === 'hline' || tool === 'vline') {
-    const obj: DrawObject = { id: genId(), kind: tool, points: [pt], color: randomColor() }
-    drawings.value = [...drawings.value, obj]
-  } else {
-    pendingObj = { id: genId(), kind: tool, points: [pt], color: randomColor() }
-    mode = 'placing'
-    emit('toolState', true)
-  }
-  primitive?.setObjects(drawings.value)
-}
-
-function handleMove(x: number, y: number) {
-  if (mode === 'dragging' && dragId) {
-    const pt = primitive?.screenToPoint(x, y)
-    if (!pt) return
-    const idx = drawings.value.findIndex((d) => d.id === dragId)
-    if (idx >= 0) {
-      const copy = { ...drawings.value[idx], points: [...drawings.value[idx].points] }
-      copy.points[dragAnchorIndex] = pt
-      drawings.value = drawings.value.map((d, i) => (i === idx ? copy : d))
-      primitive?.setObjects(drawings.value)
+/** 磁吸：吸附最近 K 线的 O/H/L/C 价格点（Ctrl/Cmd 按住或 Magnet 开关启用）。 */
+function applyMagnet(pt: DrawPoint): DrawPoint {
+  if (!magnetActive.value) return pt
+  const klines = props.data
+  if (!klines.length) return pt
+  let best = klines[0]
+  let bestDiff = Infinity
+  for (const k of klines) {
+    const d = Math.abs(k.time - pt.time)
+    if (d < bestDiff) {
+      bestDiff = d
+      best = k
     }
   }
+  const cand = [best.open, best.high, best.low, best.close]
+  let bp = cand[0]
+  for (const c of cand) {
+    if (Math.abs(c - pt.price) < Math.abs(bp - pt.price)) bp = c
+  }
+  return { time: best.time, price: bp }
+}
+
+function onChartClick(x: number, y: number) {
+  // cursor 模式的选区/拖动已由 mousedown 处理，这里只负责放置绘制点
+  if (currentTool() === 'cursor') return
+  const pt = primitive?.screenToPoint(x, y)
+  if (!pt) return
+  placePoint(applyMagnet(pt))
+}
+
+function onChartMove(x: number, y: number) {
+  if (mode.value === 'dragging') return
+  if (mode.value === 'placing' && pendingObj) {
+    const pt = primitive?.screenToPoint(x, y)
+    if (!pt) return
+    previewPoint = applyMagnet(pt)
+    primitive?.setPreview({
+      kind: pendingObj.kind,
+      points: [...pendingObj.points, previewPoint],
+      color: pendingObj.color,
+    })
+    return
+  }
+  const tool = currentTool()
+  if ((tool === 'vline' || tool === 'hray') && mode.value === 'idle') {
+    const pt = primitive?.screenToPoint(x, y)
+    if (!pt) return
+    primitive?.setPreview({ kind: tool, points: [applyMagnet(pt)], color: '#3b82f6' })
+    return
+  }
+  if (tool === 'cursor') {
+    const hit = primitive?.hitTestObjects(drawings.value, x, y) ?? null
+    hoverState.value = hit ? ('index' in hit ? 'anchor' : 'body') : null
+  }
+}
+
+function placePoint(pt: DrawPoint) {
+  const tool = currentTool()
+  if (!isDrawingTool(tool)) return
+  if (!pendingObj) {
+    pendingObj = {
+      id: genId(),
+      kind: tool,
+      color: randomColor(),
+      points: [],
+      lineWidth: 2,
+      lineStyle: 'solid',
+      locked: false,
+      zIndex: Date.now(),
+      createdAt: Date.now(),
+      // 斐波那契工具：默认勾选标准层级（后续可在悬浮工具栏设置弹窗中勾选预设层级）
+      ...(tool === 'fib' ? { enabledLevels: [...FIB_LEVELS] } : tool === 'fibext' ? { enabledLevels: [...FIBEXT_LEVELS] } : {}),
+    }
+  }
+  pendingObj.points.push(pt)
+  const needed = POINT_COUNT[pendingObj.kind]
+  if (pendingObj.points.length >= needed) {
+    const done = pendingObj
+    pendingObj = null
+    // 持仓工具：第 2 点（多头=止盈 / 空头=止损）确定后，自动物化入场价镜像的第 3 个锚点
+    // （止损 = 2×入场 − 止盈；空头反之）。物化后 3 个锚点即可独立拖拽。
+    if (done.kind === 'long' || done.kind === 'short') {
+      const [p0, p1] = done.points
+      done.points.push({ time: p0.time, price: 2 * p0.price - p1.price })
+    }
+    mode.value = 'idle'
+    previewPoint = null
+    primitive?.setPreview(null)
+    drawings.value = [...drawings.value, done]
+    selectObject(done.id)
+    emit('toolState', false)
+    emit('drawingDone') // App.vue 根据 stayInMode 决定是否切回 cursor
+  } else {
+    mode.value = 'placing'
+    emit('toolState', true)
+  }
+}
+
+function cancelPending() {
+  if (!pendingObj) return
+  pendingObj = null
+  mode.value = 'idle'
+  previewPoint = null
+  primitive?.setPreview(null)
+  emit('toolState', false)
 }
 
 function handleMouseDown(e: MouseEvent) {
   if (currentTool() !== 'cursor') return
-  const hit = hitTestAnchor(e.offsetX, e.offsetY)
-  if (hit) {
-    dragId = hit.id
-    dragAnchorIndex = hit.index
-    mode = 'dragging'
+  const x = e.offsetX
+  const y = e.offsetY
+  const hit = primitive?.hitTestObjects(drawings.value, x, y) ?? null
+  if (!hit) {
+    deselect()
+    return
   }
+  const obj = drawings.value.find((d) => d.id === hit.id)
+  if (!obj) {
+    deselect()
+    return
+  }
+  selectObject(hit.id)
+  if (obj.locked) return
+  // Bug B：拖拽画线/锚点时禁用底层图表左键拖拽平移，避免底图跟随滑动
+  e.preventDefault()
+  chart?.applyOptions({ handleScroll: { pressedMouseMove: false } })
+  mode.value = 'dragging'
+  dragId = hit.id
+  dragIndex = 'index' in hit ? hit.index : null
+  const pt = primitive?.screenToPoint(x, y)
+  dragOrigin = pt ?? { time: 0, price: 0 }
+  dragStartPoints = obj.points.map((p) => ({ ...p }))
 }
 
 function handleDocMove(e: MouseEvent) {
-  if (mode === 'dragging' && dragId && container.value) {
-    const rect = container.value.getBoundingClientRect()
-    handleMove(e.clientX - rect.left, e.clientY - rect.top)
-  }
+  if (mode.value !== 'dragging' || !dragId || !container.value) return
+  const rect = container.value.getBoundingClientRect()
+  const pt = primitive?.screenToPoint(e.clientX - rect.left, e.clientY - rect.top)
+  if (!pt || !dragOrigin) return
+  const snapped = applyMagnet(pt)
+  drawings.value = drawings.value.map((d) => {
+    if (d.id !== dragId) return d
+    if (dragIndex != null) {
+      return { ...d, points: d.points.map((p, i) => (i === dragIndex ? snapped : p)) }
+    }
+    const dt = snapped.time - dragOrigin!.time
+    const dp = snapped.price - dragOrigin!.price
+    return {
+      ...d,
+      points: d.points.map((p, i) => ({ time: dragStartPoints[i].time + dt, price: dragStartPoints[i].price + dp })),
+    }
+  })
+  primitive?.setObjects(drawings.value, selectedId.value)
+  updateToolbarPos()
 }
 
 function handleMouseUp() {
-  if (mode === 'dragging') {
-    mode = 'idle'
+  if (mode.value === 'dragging') {
+    mode.value = 'idle'
+    // 恢复底图拖拽平移
+    chart?.applyOptions({ handleScroll: { pressedMouseMove: true } })
     dragId = null
-    emit('toolState', false)
+    dragIndex = null
+    dragOrigin = null
+    dragStartPoints = []
   }
 }
 
 function handleDblClick(e: MouseEvent) {
   if (currentTool() !== 'cursor') return
-  const hit = hitTestAnchor(e.offsetX, e.offsetY)
-  if (hit) {
-    drawings.value = drawings.value.filter((d) => d.id !== hit.id)
-    primitive?.setObjects(drawings.value)
-    emit('toolState', false)
+  const hit = primitive?.hitTestObjects(drawings.value, e.offsetX, e.offsetY) ?? null
+  if (!hit) return
+  drawings.value = drawings.value.filter((d) => d.id !== hit.id)
+  if (selectedId.value === hit.id) deselect()
+  else primitive?.setObjects(drawings.value, selectedId.value)
+}
+
+// ---- 选区 / 悬浮工具栏 / 层级 ----
+function selectObject(id: string) {
+  selectedId.value = id
+  primitive?.setObjects(drawings.value, id)
+  updateToolbarPos()
+}
+
+function deselect() {
+  selectedId.value = null
+  toolbarPos.value = null
+  primitive?.setObjects(drawings.value, null)
+}
+
+function updateToolbarPos() {
+  const obj = selectedObj.value
+  if (!obj || !primitive || !container.value) return
+  const p = obj.points[0]
+  if (!p) return
+  const x = primitive.timeToX(p.time)
+  const y = primitive.priceToY(p.price)
+  if (x == null || y == null) return
+  const cw = container.value.clientWidth
+  toolbarPos.value = {
+    left: Math.min(Math.max(4, x), cw - 160),
+    top: Math.max(4, y - 40),
   }
 }
 
-function hitTestAnchor(x: number, y: number): { id: string; index: number } | null {
-  for (const obj of drawings.value) {
-    for (let i = 0; i < obj.points.length; i++) {
-      const px = primitive?.timeToX(obj.points[i].time)
-      const py = primitive?.priceToY(obj.points[i].price)
-      if (px != null && py != null && Math.abs(px - x) <= 6 && Math.abs(py - y) <= 6) {
-        return { id: obj.id, index: i }
-      }
-    }
+function patchSelected(patch: Partial<DrawObject>) {
+  const id = selectedId.value
+  if (!id) return
+  drawings.value = drawings.value.map((d) => (d.id === id ? { ...d, ...patch } : d))
+  primitive?.setObjects(drawings.value, id)
+}
+
+function deleteSelected() {
+  const id = selectedId.value
+  if (!id) return
+  drawings.value = drawings.value.filter((d) => d.id !== id)
+  deselect()
+}
+
+function zOrder(front: boolean) {
+  const id = selectedId.value
+  if (!id) return
+  let ref = front ? -Infinity : Infinity
+  for (const d of drawings.value) {
+    if (d.id === id) continue
+    ref = front ? Math.max(ref, d.zIndex) : Math.min(ref, d.zIndex)
   }
-  return null
+  const next = front ? (ref === -Infinity ? 0 : ref + 1) : (ref === Infinity ? 0 : ref - 1)
+  drawings.value = drawings.value.map((d) => (d.id === id ? { ...d, zIndex: next } : d))
+  primitive?.setObjects(drawings.value, id)
+}
+
+// ---- 快捷键 ----
+function onKeydown(e: KeyboardEvent) {
+  const t = e.target as HTMLElement | null
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
+  if (e.key === 'Delete' || e.key === 'Backspace') {
+    e.preventDefault()
+    deleteSelected()
+  } else if (e.key === 'Escape') {
+    cancelPending()
+    deselect()
+  } else if (e.key === 'Control' || e.key === 'Meta') {
+    magnetHeld.value = true
+  }
+}
+
+function onKeyup(e: KeyboardEvent) {
+  if (e.key === 'Control' || e.key === 'Meta') magnetHeld.value = false
 }
 
 let idCounter = 0
@@ -365,11 +565,23 @@ function genId(): string {
 </script>
 
 <template>
-  <div ref="container" class="tv-chart"></div>
+  <div ref="container" class="tv-chart" :style="{ cursor: containerCursor }">
+    <DrawingToolbar
+      v-if="selectedObj"
+      :obj="selectedObj"
+      :pos="toolbarPos"
+      @change="patchSelected"
+      @delete="deleteSelected"
+      @front="zOrder(true)"
+      @back="zOrder(false)"
+      @close="deselect"
+    />
+  </div>
 </template>
 
 <style scoped>
 .tv-chart {
+  position: relative;
   width: 100%;
   height: 100%;
   min-height: 300px;
