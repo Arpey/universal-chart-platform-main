@@ -1,18 +1,30 @@
-import type { Interval, Kline } from '../types'
+import type { DataSource, Dom, Interval, Kline, Quote, TradeTick } from '../types'
+import type { WsIncoming } from './chartService'
 const wsUrl = import.meta.env.VITE_WS_URL ?? 'ws://localhost:3001/ws'
 
-type WsIncoming =
-  | { type: 'kline'; data: Kline }
-  | { type: 'connected'; symbol: string; interval: string }
-  | { type: 'error'; message: string }
+export type WsDataType = 'kline' | 'quote' | 'dom' | 'tick'
+
+export interface ConnectOptions {
+  datasource?: DataSource
+  /** 订阅类型：kline（默认）| quote | dom | tick */
+  dataType?: WsDataType
+  onKline?: (kline: Kline) => void
+  /** 全量历史批量（Tradovate hist），应整表替换 */
+  onHist?: (klines: Kline[]) => void
+  onQuote?: (quote: Quote) => void
+  onDom?: (dom: Dom) => void
+  onTick?: (tick: TradeTick) => void
+  onState?: (connected: boolean) => void
+  onError?: (message: string) => void
+}
 
 export function connectMarket(
   symbol: string,
   interval: Interval,
-  onKline: (kline: Kline) => void,
-  onState: (connected: boolean) => void,
+  opts: ConnectOptions = {},
 ) {
-  const url = `${wsUrl}?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}`
+  const { datasource = 'binance', dataType = 'kline' } = opts
+  const url = `${wsUrl}?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&datasource=${datasource}&dataType=${dataType}`
   let socket: WebSocket | null = null
   let stopped = false
   let retries = 0
@@ -20,7 +32,7 @@ export function connectMarket(
 
   const scheduleReconnect = () => {
     if (stopped) return // 已被手动断开或替换，禁止重连
-    onState(false)
+    opts.onState?.(false)
     // 指数退避：1s,2s,4s...最大 15s，加随机抖动避免集中重连
     const delay = Math.min(1000 * 2 ** retries, 15_000) + Math.floor(Math.random() * 300)
     retries += 1
@@ -32,7 +44,7 @@ export function connectMarket(
     socket = new WebSocket(url)
     socket.onopen = () => {
       retries = 0
-      onState(true)
+      opts.onState?.(true)
     }
     socket.onclose = scheduleReconnect
     socket.onerror = () => { socket?.close() } // close 会触发 onclose → 重连
@@ -43,11 +55,31 @@ export function connectMarket(
       } catch {
         return // 忽略无法解析的消息
       }
-      // 只把真正的 K 线数据交给 store；connected / error 等协议消息忽略
-      if (msg?.type === 'kline' && msg.data) {
-        onKline(msg.data)
-      } else if (msg?.type === 'connected') {
-        onState(true)
+      switch (msg?.type) {
+        case 'kline':
+          if (msg.data) opts.onKline?.(msg.data as Kline)
+          break
+        case 'hist':
+          if (msg.data) opts.onHist?.(msg.data as Kline[])
+          break
+        case 'quote':
+          if (msg.data) opts.onQuote?.(msg.data as Quote)
+          break
+        case 'dom':
+          if (msg.data) opts.onDom?.(msg.data as Dom)
+          break
+        case 'tick':
+          if (msg.data) opts.onTick?.(msg.data as TradeTick)
+          break
+        case 'connected':
+          opts.onState?.(true)
+          break
+        case 'error':
+          opts.onError?.(msg.message ?? '数据源错误')
+          opts.onState?.(false)
+          break
+        default:
+          break
       }
     }
   }
@@ -60,3 +92,4 @@ export function connectMarket(
     socket = null
   }
 }
+

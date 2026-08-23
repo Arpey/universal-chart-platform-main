@@ -3,11 +3,14 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import SymbolSearchModal from './components/SymbolSearchModal.vue'
 import Watchlist from './components/Watchlist.vue'
 import TradingChart from './components/TradingChart.vue'
+import DepthPanel from './components/DepthPanel.vue'
+import TradeTape from './components/TradeTape.vue'
 import StatusBar from './components/StatusBar.vue'
 import IndicatorsModal from './components/IndicatorsModal.vue'
 import { useMarketStore } from './stores/marketStore'
-import { connectMarket } from './services/wsService'
+import { connectMarket, type WsDataType } from './services/wsService'
 import { useCountdown } from './composables/useCountdown'
+import type { DataSource, MarketView } from './types'
 import type { DrawKind } from './types/drawing'
 
 const market = useMarketStore()
@@ -20,6 +23,34 @@ const activeTool = ref<DrawKind>('cursor')
 const clearSignal = ref(0)
 const toolActive = ref(false)
 let disconnect = () => {}
+
+/** 可用数据源（后端 /api/datasources 下发，Tradovate 需配置后才启用） */
+const dataSources = ref<Array<{ id: DataSource; label: string; markets: string[] }>>([{ id: 'binance', label: 'Binance', markets: ['kline'] }])
+const currentSourceLabel = computed(() => dataSources.value.find((d) => d.id === market.datasource)?.label ?? market.datasource)
+
+/** 图表视图选项（盘口/Tick 仅 Tradovate 支持） */
+const VIEWS: { id: MarketView; label: string; hint: string }[] = [
+  { id: 'candlestick', label: 'K线', hint: 'K 线图 / 蜡烛图' },
+  { id: 'dom', label: '盘口', hint: '盘口订单簿（Depth of Market）' },
+  { id: 'tick', label: 'Tick', hint: '逐笔成交流（Time & Sales）' },
+]
+const viewDataTypes: Record<MarketView, WsDataType> = { candlestick: 'kline', dom: 'dom', tick: 'tick' }
+const isTradovate = computed(() => market.datasource === 'tradovate')
+
+/** 顶部标的徽标：Tradovate 合约名去掉月份代码（NQU6 → NQ）。 */
+const symbolRoot = computed(() => {
+  if (isTradovate.value) return market.symbol.replace(/[FGHJKMNQUVXZ]\d$/, '') || market.symbol
+  return market.symbol.slice(0, market.symbol.indexOf('USDT')).slice(0, 4) || market.symbol
+})
+
+function pickView(v: MarketView) {
+  if (v !== 'candlestick' && !isTradovate.value) return // 非 Tradovate 仅支持 K 线
+  market.setView(v)
+}
+
+function pickDatasource(id: DataSource) {
+  market.setDatasource(id)
+}
 
 const DRAW_GROUPS: { title: string; items: { key: DrawKind; icon: string; title: string }[] }[] = [
   { title: '选择', items: [{ key: 'cursor', icon: '🖱', title: '光标/选择' }] },
@@ -85,16 +116,34 @@ function clearDrawings() {
   clearSignal.value++
 }
 
-async function refresh() {
+function refresh() {
   disconnect()
-  await market.load()
-  disconnect = connectMarket(market.symbol, market.interval, market.update, value => connected.value = value)
+  void market.load()
+  disconnect = connectMarket(market.symbol, market.interval, {
+    datasource: market.datasource,
+    dataType: viewDataTypes[market.view],
+    onKline: market.update,
+    onHist: market.applyHist,
+    onDom: market.setDom,
+    onTick: market.addTrade,
+    onState: (value) => { connected.value = value },
+    onError: (message) => { market.error = message },
+  })
 }
 
-watch(() => [market.symbol, market.interval], refresh)
+// 标的 / 周期 / 数据源 / 视图任一变化都重建订阅
+watch(() => [market.symbol, market.interval, market.datasource, market.view], refresh)
 onMounted(async () => {
   await market.loadUniverse()
   refresh()
+  // 拉取可用数据源列表（决定是否显示 Tradovate 切换按钮）
+  try {
+    const res = await fetch(`${import.meta.env.VITE_API_URL ?? 'http://localhost:3001'}/api/datasources`)
+    if (res.ok) {
+      const data = await res.json() as { datasources: Array<{ id: DataSource; label: string; markets: string[] }> }
+      if (Array.isArray(data.datasources) && data.datasources.length) dataSources.value = data.datasources
+    }
+  } catch { /* 默认仅 Binance */ }
 })
 onBeforeUnmount(() => disconnect())
 
@@ -109,7 +158,7 @@ function formatPrice(value?: number) {
     <header class="topbar">
       <div class="ticker-strip">
         <button class="symbol-btn" title="切换交易对" @click="searchOpen = true">
-          <em>{{ market.symbol.slice(0, market.symbol.indexOf('USDT')).slice(0, 4) }}</em>
+          <em>{{ symbolRoot }}</em>
           <b>{{ market.symbol }}</b>
           <span class="caret">▾</span>
         </button>
@@ -121,9 +170,31 @@ function formatPrice(value?: number) {
             @click="market.interval = item"
           >{{ item }}</button>
         </div>
+        <!-- 数据源切换 -->
+        <div class="src-switch">
+          <button
+            v-for="ds in dataSources"
+            :key="ds.id"
+            class="src-btn"
+            :class="{ active: market.datasource === ds.id }"
+            :title="ds.id === 'tradovate' ? 'Tradovate 美股指/期货行情（demo / live）' : 'Binance U 本位永续合约'"
+            @click="pickDatasource(ds.id)"
+          >{{ ds.label }}</button>
+        </div>
         <button class="ind-btn" title="指标（Indicators）" @click="indicatorModalOpen = true">
           <span class="ind-fx">ƒx</span>
         </button>
+        <!-- 图表视图切换：K线 / 盘口 / Tick 流 -->
+        <div class="view-switch">
+          <button
+            v-for="v in VIEWS"
+            :key="v.id"
+            class="view-btn"
+            :class="{ active: market.view === v.id, disabled: v.id !== 'candlestick' && !isTradovate }"
+            :title="v.id !== 'candlestick' && !isTradovate ? '仅 Tradovate 数据源支持' : v.hint"
+            @click="pickView(v.id)"
+          >{{ v.label }}</button>
+        </div>
         <span class="candle-countdown" title="距下一根 K 线开盘">⏱ {{ candleCountdown }}</span>
         <span v-if="market.ticker" class="last-price" :class="market.ticker.change24h >= 0 ? 'up' : 'down'">
           {{ formatPrice(market.ticker.price) }}
@@ -133,7 +204,7 @@ function formatPrice(value?: number) {
         </span>
       </div>
       <div class="topbar-right">
-        <span class="badge">PERPETUAL · USDT <b>●</b></span>
+        <span class="badge">{{ currentSourceLabel }} · {{ isTradovate ? 'FUTURES' : 'PERPETUAL · USDT' }} <b>●</b></span>
         <button class="search-btn" title="搜索交易对" @click="searchOpen = true">⌕</button>
       </div>
     </header>
@@ -169,6 +240,7 @@ function formatPrice(value?: number) {
           {{ TOOL_HINTS[activeTool] ?? '点击图表开始绘制' }} · 双击锚点删除 · Esc 取消
         </div>
         <TradingChart
+          v-if="market.view === 'candlestick'"
           :data="market.klines"
           :interval="market.interval"
           :active-tool="activeTool"
@@ -178,11 +250,22 @@ function formatPrice(value?: number) {
           @tool-state="toolActive = $event"
           @drawing-done="onDrawingDone"
         />
+        <DepthPanel
+          v-else-if="market.view === 'dom'"
+          :dom="market.dom"
+          :quote="market.quote"
+          :symbol="market.symbol"
+        />
+        <TradeTape
+          v-else
+          :trades="market.trades"
+          :symbol="market.symbol"
+        />
       </div>
       <Watchlist />
     </section>
 
-    <StatusBar :connected="connected" :count="market.klines.length" />
+    <StatusBar :connected="connected" :count="market.klines.length" :datasource="currentSourceLabel" :view="market.view" />
     <SymbolSearchModal v-model:open="searchOpen" />
     <IndicatorsModal :open="indicatorModalOpen" @close="indicatorModalOpen = false" />
   </main>
@@ -249,6 +332,27 @@ function formatPrice(value?: number) {
 }
 .periods button:hover { color: var(--color-text); border-color: var(--color-border); }
 .periods button.active { background: #3b82f6; color: #fff; }
+
+/* 数据源切换 */
+.src-switch { display: flex; gap: 2px; }
+.src-btn {
+  padding: 4px 8px; background: transparent; color: var(--color-text-muted);
+  border: 1px solid var(--color-border); border-radius: 4px;
+  font-size: 10px; font-weight: 700; cursor: pointer; text-transform: uppercase;
+}
+.src-btn:hover { color: var(--color-text); border-color: #3b82f6; }
+.src-btn.active { background: rgba(59, 130, 246, 0.14); color: #3b82f6; border-color: #3b82f6; }
+
+/* 图表视图切换：K线 / 盘口 / Tick 流 */
+.view-switch { display: flex; gap: 2px; }
+.view-btn {
+  padding: 4px 8px; background: transparent; color: var(--color-text-muted);
+  border: 1px solid transparent; border-radius: 4px;
+  font-size: 11px; font-weight: 600; cursor: pointer;
+}
+.view-btn:hover { color: var(--color-text); border-color: var(--color-border); }
+.view-btn.active { background: #3b82f6; color: #fff; }
+.view-btn.disabled { opacity: 0.35; cursor: not-allowed; }
 
 /* 指标（Indicators）按钮 */
 .ind-btn {

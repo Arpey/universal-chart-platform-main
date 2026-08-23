@@ -4,12 +4,13 @@ import { useMarketStore } from '../stores/marketStore'
 import { useSymbolRows } from '../composables/useSymbolRows'
 import type { SymbolRow } from '../types'
 
-type SourceTabId = 'all' | 'binance' | 'stocks' | 'forex'
+type SourceTabId = 'all' | 'binance' | 'tradovate' | 'stocks' | 'forex'
 
-/** 数据源/分类 Tab：目前仅 Binance 有真实数据，其余为占位（空状态提示）。 */
+/** 数据源/分类 Tab：Binance 与 Tradovate 为真实数据源，其余为占位（空状态提示）。 */
 const TABS: { id: SourceTabId; label: string; hint?: string }[] = [
   { id: 'all', label: 'All' },
   { id: 'binance', label: 'Binance' },
+  { id: 'tradovate', label: 'Tradovate' },
   { id: 'stocks', label: 'Stocks', hint: '暂无股票数据源接入' },
   { id: 'forex', label: 'Forex', hint: '暂无外汇数据源接入' },
 ]
@@ -28,11 +29,19 @@ const listRef = ref<HTMLElement>()
 
 const isEmptyTab = computed(() => activeTab.value === 'stocks' || activeTab.value === 'forex')
 
+/** 点击数据源 Tab：切换当前数据源（触发列表重新加载），保持 Tab 高亮同步。 */
+function pickTab(id: SourceTabId) {
+  activeTab.value = id
+  if (id === 'tradovate' && market.datasource !== 'tradovate') market.setDatasource('tradovate')
+  else if (id === 'binance' && market.datasource !== 'binance') market.setDatasource('binance')
+}
+
 /** 按 Tab + 关键字（代码 symbol / 名称 baseAsset）过滤。 */
 const filtered = computed<SymbolRow[]>(() => {
   if (isEmptyTab.value) return []
   let list = rows.value
   if (activeTab.value === 'binance') list = list.filter((r) => r.source === 'binance')
+  if (activeTab.value === 'tradovate') list = list.filter((r) => r.source === 'tradovate')
   const q = query.value.trim().toUpperCase()
   if (q) list = list.filter((r) => r.symbol.includes(q) || r.baseAsset.includes(q))
   return list
@@ -125,7 +134,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
             :key="tab.id"
             class="tab"
             :class="{ active: activeTab === tab.id }"
-            @click="activeTab = tab.id"
+            @click="pickTab(tab.id)"
           >{{ tab.label }}</button>
         </div>
       </header>

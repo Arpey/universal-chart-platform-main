@@ -11,11 +11,12 @@ export function useSymbolRows() {
 
   const rows = computed<SymbolRow[]>(() => {
     const t = new Map(market.tickers.map((x) => [x.symbol, x]))
+    const source = market.datasource
     return market.symbols.map((s) => {
       const tick = t.get(s.symbol)
       return {
         ...s,
-        source: 'binance',
+        source,
         price: tick?.price ?? 0,
         change24h: tick?.change24h ?? 0,
         volume24h: tick?.volume24h ?? 0,
