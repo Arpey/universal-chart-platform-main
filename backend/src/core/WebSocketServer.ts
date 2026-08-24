@@ -6,7 +6,7 @@ import type { Interval } from '../types/kline'
 import { logger } from '../utils/logger'
 
 const INTERVALS = ['1m', '5m', '15m', '1h', '4h', '1d'] as const
-const DATASOURCES = ['binance', 'tradovate'] as const
+const DATASOURCES = ['binance', 'tradovate', 'tradefi'] as const
 const DATA_TYPES = ['kline', 'quote', 'dom', 'tick'] as const
 
 type WsDataType = (typeof DATA_TYPES)[number]
@@ -34,7 +34,7 @@ export function attachMarketSocket(server: Server, manager = new MarketManager()
     const query = new URL(request.url ?? '', 'http://localhost').searchParams
     const symbol = query.get('symbol') ?? 'BTCUSDT'
     const interval = (query.get('interval') ?? '1m') as Interval
-    const datasource = query.get('datasource') ?? 'binance'
+    const datasource = query.get('source') ?? query.get('datasource') ?? 'binance'
     const dataType = (query.get('dataType') ?? 'kline') as WsDataType
 
     let unsubscribe: (() => void) | null = null

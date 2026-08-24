@@ -39,3 +39,13 @@ export const config = {
     proxy: process.env.TRADOVATE_PROXY ?? ''
   }
 }
+
+// ===== TradeFi 白名单分类（基于币安 U 本位合约，非独立数据源） =====
+/** tradefi 分类允许的交易对白名单（逗号分隔，如 XAUUSDT,NVDAUSDT）。 */
+export const TRADEFI_SYMBOLS: string[] = (process.env.TRADEFI_SYMBOLS ?? '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean)
+
+/** 全部模式（binance）下是否隐藏 TRADEFI_SYMBOLS 中的品种。 */
+export const HIDE_TRADEFI_IN_BINANCE = process.env.HIDE_TRADEFI_IN_BINANCE === 'true'

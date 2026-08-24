@@ -5,7 +5,8 @@ const wsUrl = import.meta.env.VITE_WS_URL ?? 'ws://localhost:3001/ws'
 export type WsDataType = 'kline' | 'quote' | 'dom' | 'tick'
 
 export interface ConnectOptions {
-  datasource?: DataSource
+  /** 数据源/分类：binance（默认）| tradefi | tradovate */
+  source?: DataSource
   /** 订阅类型：kline（默认）| quote | dom | tick */
   dataType?: WsDataType
   onKline?: (kline: Kline) => void
@@ -18,13 +19,20 @@ export interface ConnectOptions {
   onError?: (message: string) => void
 }
 
+export interface MarketConnection {
+  disconnect: () => void
+  /** 切换数据源/分类并自动重连（如 binance → tradefi）。 */
+  setSource: (source: DataSource) => void
+}
+
 export function connectMarket(
   symbol: string,
   interval: Interval,
   opts: ConnectOptions = {},
-) {
-  const { datasource = 'binance', dataType = 'kline' } = opts
-  const url = `${wsUrl}?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&datasource=${datasource}&dataType=${dataType}`
+): MarketConnection {
+  const { source = 'binance', dataType = 'kline' } = opts
+  let currentSource: DataSource = source
+  const url = () => `${wsUrl}?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&source=${currentSource}&dataType=${dataType}`
   let socket: WebSocket | null = null
   let stopped = false
   let retries = 0
@@ -41,7 +49,7 @@ export function connectMarket(
 
   const connect = () => {
     if (stopped) return
-    socket = new WebSocket(url)
+    socket = new WebSocket(url())
     socket.onopen = () => {
       retries = 0
       opts.onState?.(true)
@@ -85,11 +93,21 @@ export function connectMarket(
   }
 
   connect()
-  return () => {
-    stopped = true // 清理后永不重连，防止旧连接定时器泄漏
-    if (reconnectTimer !== null) window.clearTimeout(reconnectTimer)
-    socket?.close()
-    socket = null
+
+  return {
+    disconnect: () => {
+      stopped = true // 清理后永不重连，防止旧连接定时器泄漏
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer)
+      socket?.close()
+      socket = null
+    },
+    setSource: (next) => {
+      if (stopped || currentSource === next) return
+      currentSource = next
+      // 关闭当前连接触发 onclose → 自动用新 URL 重连；已断开则直接重建
+      if (socket && socket.readyState !== WebSocket.CLOSED) socket.close()
+      else connect()
+    },
   }
 }
 

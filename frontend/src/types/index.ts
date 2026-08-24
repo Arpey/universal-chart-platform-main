@@ -1,6 +1,8 @@
 export type Interval = '1m' | '5m' | '15m' | '1h' | '4h' | '1d'
 /** 数据源：binance（默认）/ tradovate（美股指/期货） */
-export type DataSource = 'binance' | 'tradovate'
+export type DataSource = 'binance' | 'tradovate' | 'tradefi'
+/** 分类（切换器）：全部合约 / Tradefi（基于币安 U 本位白名单） */
+export type Source = 'binance' | 'tradefi'
 /** 图表视图：K 线 / 盘口订单簿 / Tick 流 */
 export type MarketView = 'candlestick' | 'dom' | 'tick'
 export interface Kline { time: number; open: number; high: number; low: number; close: number; volume: number }

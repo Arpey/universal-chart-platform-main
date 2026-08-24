@@ -33,7 +33,7 @@ const isEmptyTab = computed(() => activeTab.value === 'stocks' || activeTab.valu
 function pickTab(id: SourceTabId) {
   activeTab.value = id
   if (id === 'tradovate' && market.datasource !== 'tradovate') market.setDatasource('tradovate')
-  else if (id === 'binance' && market.datasource !== 'binance') market.setDatasource('binance')
+  else if (id === 'binance' && market.datasource !== 'binance') market.switchSource('binance')
 }
 
 /** 按 Tab + 关键字（代码 symbol / 名称 baseAsset）过滤。 */

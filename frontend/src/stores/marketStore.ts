@@ -1,12 +1,14 @@
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
-import type { DataSource, Dom, Interval, Kline, MarketView, Quote, SymbolInfo, Ticker, TradeTick } from '../types'
+import { computed, ref } from 'vue'
+import type { DataSource, Dom, Interval, Kline, MarketView, Quote, Source, SymbolInfo, Ticker, TradeTick } from '../types'
 import { fetchMarket, fetchSymbols, fetchTickers } from '../services/chartService'
 
-const DEFAULT_SYMBOL: Record<DataSource, string> = { binance: 'BTCUSDT', tradovate: 'NQ' }
+const DEFAULT_SYMBOL: Record<DataSource, string> = { binance: 'BTCUSDT', tradovate: 'NQ', tradefi: 'XAUUSDT' }
 
 export const useMarketStore = defineStore('market', () => {
   const datasource = ref<DataSource>('binance')
+  /** 当前分类：全部合约 / Tradefi（与 datasource 保持同步，tradovate 不在分类内）。 */
+  const currentSource = ref<Source>('binance')
   const view = ref<MarketView>('candlestick')
   const symbol = ref(DEFAULT_SYMBOL.binance); const interval = ref<Interval>('1m'); const klines = ref<Kline[]>([]); const ticker = ref<Ticker>(); const loading = ref(false); const error = ref('')
   const symbols = ref<SymbolInfo[]>([]); const tickers = ref<Ticker[]>([]); const universeLoading = ref(false); const universeError = ref('')
@@ -44,10 +46,26 @@ export const useMarketStore = defineStore('market', () => {
     finally { universeLoading.value = false }
   }
 
+  /** 数据源分类选项：全部合约 / Tradefi。 */
+  const availableSources = computed<Array<{ id: Source; label: string }>>(() => [
+    { id: 'binance', label: '全部合约' },
+    { id: 'tradefi', label: 'Tradefi' },
+  ])
+
+  /** 切换分类（全部合约 / Tradefi），映射到底层 datasource 并刷新列表与 K 线。 */
+  function switchSource(next: Source) {
+    if (currentSource.value === next && datasource.value === next) return
+    currentSource.value = next
+    setDatasource(next === 'tradefi' ? 'tradefi' : 'binance')
+  }
+
   /** 切换数据源（同时重置标的为各源默认合约并重新加载列表）。 */
   function setDatasource(next: DataSource) {
     if (datasource.value === next) return
     datasource.value = next
+    // 分类与底层数据源保持同步（tradovate 不在分类切换器内，保持当前分类不变）
+    if (next === 'tradefi') currentSource.value = 'tradefi'
+    else if (next === 'binance') currentSource.value = 'binance'
     symbol.value = DEFAULT_SYMBOL[next]
     // 数据源切换后清空全部跨源数据，避免残留上一数据源的列表/行情
     klines.value = []
@@ -130,10 +148,10 @@ export const useMarketStore = defineStore('market', () => {
   }
 
   return {
-    datasource, view, symbol, interval, klines, ticker, loading, error,
+    datasource, currentSource, availableSources, view, symbol, interval, klines, ticker, loading, error,
     symbols, tickers, universeLoading, universeError,
     quote, dom, trades, domConnected,
-    load, loadUniverse, setDatasource, setView, setSymbol,
+    load, loadUniverse, setDatasource, switchSource, setView, setSymbol,
     update, applyHist, setQuote, setDom, addTrade, setPrice,
   }
 })

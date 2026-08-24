@@ -10,18 +10,18 @@ async function toError(response: Response, fallback: string): Promise<Error> {
   return new Error(fallback)
 }
 
-export async function fetchMarket(symbol: string, interval: Interval, datasource: DataSource = 'binance') {
-  const response = await fetch(`${apiUrl}/api/market?symbol=${symbol}&interval=${interval}&limit=300&datasource=${datasource}`)
+export async function fetchMarket(symbol: string, interval: Interval, source: DataSource = 'binance') {
+  const response = await fetch(`${apiUrl}/api/market?symbol=${symbol}&interval=${interval}&limit=300&source=${source}`)
   if (!response.ok) throw await toError(response, '行情服务暂不可用')
   return await response.json() as { klines: Kline[]; ticker: Ticker }
 }
-export async function fetchSymbols(datasource: DataSource = 'binance') {
-  const response = await fetch(`${apiUrl}/api/symbols?datasource=${datasource}`)
+export async function fetchSymbols(source: DataSource = 'binance') {
+  const response = await fetch(`${apiUrl}/api/symbols?source=${source}`)
   if (!response.ok) throw await toError(response, '交易对列表不可用')
   return await response.json() as SymbolInfo[]
 }
-export async function fetchTickers(datasource: DataSource = 'binance') {
-  const response = await fetch(`${apiUrl}/api/tickers?datasource=${datasource}`)
+export async function fetchTickers(source: DataSource = 'binance') {
+  const response = await fetch(`${apiUrl}/api/tickers?source=${source}`)
   if (!response.ok) throw await toError(response, '行情快照不可用')
   return await response.json() as Ticker[]
 }

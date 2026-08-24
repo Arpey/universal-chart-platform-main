@@ -7,10 +7,11 @@ import DepthPanel from './components/DepthPanel.vue'
 import TradeTape from './components/TradeTape.vue'
 import StatusBar from './components/StatusBar.vue'
 import IndicatorsModal from './components/IndicatorsModal.vue'
+import DataSourceSwitcher from './components/DataSourceSwitcher.vue'
 import { useMarketStore } from './stores/marketStore'
 import { connectMarket, type WsDataType } from './services/wsService'
 import { useCountdown } from './composables/useCountdown'
-import type { DataSource, MarketView } from './types'
+import type { MarketView } from './types'
 import type { DrawKind } from './types/drawing'
 
 const market = useMarketStore()
@@ -24,9 +25,11 @@ const clearSignal = ref(0)
 const toolActive = ref(false)
 let disconnect = () => {}
 
-/** 可用数据源（后端 /api/datasources 下发，Tradovate 需配置后才启用） */
-const dataSources = ref<Array<{ id: DataSource; label: string; markets: string[] }>>([{ id: 'binance', label: 'Binance', markets: ['kline'] }])
-const currentSourceLabel = computed(() => dataSources.value.find((d) => d.id === market.datasource)?.label ?? market.datasource)
+/** 顶部/状态栏数据源标签：Tradovate / Tradefi 分类 / Binance。 */
+const currentSourceLabel = computed(() => {
+  if (market.datasource === 'tradovate') return 'Tradovate'
+  return market.currentSource === 'tradefi' ? 'Tradefi' : 'Binance'
+})
 
 /** 图表视图选项（盘口/Tick 仅 Tradovate 支持） */
 const VIEWS: { id: MarketView; label: string; hint: string }[] = [
@@ -46,10 +49,6 @@ const symbolRoot = computed(() => {
 function pickView(v: MarketView) {
   if (v !== 'candlestick' && !isTradovate.value) return // 非 Tradovate 仅支持 K 线
   market.setView(v)
-}
-
-function pickDatasource(id: DataSource) {
-  market.setDatasource(id)
 }
 
 const DRAW_GROUPS: { title: string; items: { key: DrawKind; icon: string; title: string }[] }[] = [
@@ -120,7 +119,7 @@ function refresh() {
   disconnect()
   void market.load()
   disconnect = connectMarket(market.symbol, market.interval, {
-    datasource: market.datasource,
+    source: market.datasource,
     dataType: viewDataTypes[market.view],
     onKline: market.update,
     onHist: market.applyHist,
@@ -128,7 +127,7 @@ function refresh() {
     onTick: market.addTrade,
     onState: (value) => { connected.value = value },
     onError: (message) => { market.error = message },
-  })
+  }).disconnect
 }
 
 // 标的 / 周期 / 数据源 / 视图任一变化都重建订阅
@@ -136,14 +135,6 @@ watch(() => [market.symbol, market.interval, market.datasource, market.view], re
 onMounted(async () => {
   await market.loadUniverse()
   refresh()
-  // 拉取可用数据源列表（决定是否显示 Tradovate 切换按钮）
-  try {
-    const res = await fetch(`${import.meta.env.VITE_API_URL ?? 'http://localhost:3001'}/api/datasources`)
-    if (res.ok) {
-      const data = await res.json() as { datasources: Array<{ id: DataSource; label: string; markets: string[] }> }
-      if (Array.isArray(data.datasources) && data.datasources.length) dataSources.value = data.datasources
-    }
-  } catch { /* 默认仅 Binance */ }
 })
 onBeforeUnmount(() => disconnect())
 
@@ -170,17 +161,8 @@ function formatPrice(value?: number) {
             @click="market.interval = item"
           >{{ item }}</button>
         </div>
-        <!-- 数据源切换 -->
-        <div class="src-switch">
-          <button
-            v-for="ds in dataSources"
-            :key="ds.id"
-            class="src-btn"
-            :class="{ active: market.datasource === ds.id }"
-            :title="ds.id === 'tradovate' ? 'Tradovate 美股指/期货行情（demo / live）' : 'Binance U 本位永续合约'"
-            @click="pickDatasource(ds.id)"
-          >{{ ds.label }}</button>
-        </div>
+        <!-- 数据源分类切换：全部合约 / Tradefi -->
+        <DataSourceSwitcher />
         <button class="ind-btn" title="指标（Indicators）" @click="indicatorModalOpen = true">
           <span class="ind-fx">ƒx</span>
         </button>

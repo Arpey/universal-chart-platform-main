@@ -1,22 +1,13 @@
-import { BinanceFuturesAdapter } from '../adapters/BinanceFuturesAdapter'
-import { TradovateAdapter } from '../adapters/TradovateAdapter'
+import { DataSourceDriver } from '../datasources/DataSourceDriver'
 import type { MarketDataAdapter } from '../types/adapter'
 import type { Interval } from '../types/kline'
-import { config } from '../utils/config'
 
-export type DataSource = 'binance' | 'tradovate'
+export type DataSource = 'binance' | 'tradovate' | 'tradefi'
 
 export class MarketManager {
-  readonly binance = new BinanceFuturesAdapter()
-  readonly tradovate = config.tradovate.enabled ? new TradovateAdapter() : null
-
-  /** 按数据源名解析适配器（binance 为默认）。 */
+  /** 按数据源名解析适配器（binance 为默认；tradefi 为白名单过滤的币安合约；tradovate 需 TRADOVATE_* 配置）。 */
   resolve(source: string): MarketDataAdapter {
-    if (source === 'tradovate') {
-      if (!this.tradovate) throw new Error('Tradovate 数据源未配置（请检查 TRADOVATE_* 环境变量）')
-      return this.tradovate
-    }
-    return this.binance
+    return DataSourceDriver.getAdapter(source)
   }
 
   async snapshot(symbol: string, interval: Interval, limit: number, source = 'binance') {
