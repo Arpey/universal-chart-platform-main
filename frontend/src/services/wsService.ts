@@ -5,7 +5,7 @@ const wsUrl = import.meta.env.VITE_WS_URL ?? 'ws://localhost:3001/ws'
 export type WsDataType = 'kline' | 'quote' | 'dom' | 'tick'
 
 export interface ConnectOptions {
-  /** 数据源/分类：binance（默认）| tradefi | tradovate */
+  /** 数据源/分类：binance（默认）| tradefi | tradovate | ibkr */
   source?: DataSource
   /** 订阅类型：kline（默认）| quote | dom | tick */
   dataType?: WsDataType
@@ -107,6 +107,125 @@ export function connectMarket(
       // 关闭当前连接触发 onclose → 自动用新 URL 重连；已断开则直接重建
       if (socket && socket.readyState !== WebSocket.CLOSED) socket.close()
       else connect()
+    },
+  }
+}
+
+// ---------- IBKR 消息驱动订阅（CME 期货逐笔行情） ----------
+
+/** IBKR CME 期货标的（get_symbols 响应项）。 */
+export interface IBKRSymbolInfo {
+  symbol: string
+  name?: string
+  exchange?: string
+  secType?: string
+}
+
+export interface IBKRConnectOptions {
+  /** 当前订阅的 IBKR 合约（如 MES），连接建立/重连后自动发送 subscribe 消息。 */
+  symbol: string
+  /** get_symbols 返回的 CME 期货标的列表。 */
+  onSymbols?: (symbols: IBKRSymbolInfo[]) => void
+  /** IBKR tick 行情（标准化为 TradeTick，side 为空）。 */
+  onTick?: (tick: TradeTick) => void
+  onState?: (connected: boolean) => void
+  onError?: (message: string) => void
+}
+
+export interface IBKRConnection {
+  disconnect: () => void
+}
+
+/**
+ * IBKR 消息驱动连接：WebSocket 建立后通过 JSON 消息控制（而非 URL 参数订阅）。
+ * - 后端将无查询参数的连接识别为「控制通道」，不建立 URL 订阅；
+ * - 打开/重连后发送 { action: 'get_symbols', source: 'IBKR' } 拉取 CME 期货标的列表，
+ *   并发送 { action: 'subscribe', source: 'IBKR', symbol } 订阅逐笔行情；
+ * - 后端广播 { type: 'ticker', source: 'IBKR', symbol, price, size, timestamp }。
+ */
+export function connectIBKR(opts: IBKRConnectOptions): IBKRConnection {
+  let socket: WebSocket | null = null
+  let stopped = false
+  let retries = 0
+  let reconnectTimer: number | null = null
+
+  const send = (payload: unknown) => {
+    if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(payload))
+  }
+  const requestSymbols = () => send({ action: 'get_symbols', source: 'IBKR' })
+  const subscribe = () => send({ action: 'subscribe', source: 'IBKR', symbol: opts.symbol })
+
+  const connect = () => {
+    if (stopped) return
+    socket = new WebSocket(wsUrl) // 无查询参数 → 后端识别为消息驱动控制通道
+    socket.onopen = () => {
+      retries = 0
+      opts.onState?.(true)
+      requestSymbols()
+      subscribe()
+    }
+    socket.onmessage = (event) => {
+      let msg: {
+        type?: string
+        data?: unknown
+        message?: string
+        symbol?: string
+        price?: number
+        size?: number
+        timestamp?: number
+      }
+      try {
+        msg = JSON.parse(event.data as string) as typeof msg
+      } catch {
+        return // 忽略无法解析的消息
+      }
+      switch (msg?.type) {
+        case 'symbols':
+          if (Array.isArray(msg.data)) opts.onSymbols?.(msg.data as IBKRSymbolInfo[])
+          break
+        case 'ticker':
+          if (typeof msg.price === 'number' && Number.isFinite(msg.price) && msg.price > 0) {
+            opts.onTick?.({
+              symbol: String(msg.symbol ?? opts.symbol),
+              price: msg.price,
+              size: typeof msg.size === 'number' && msg.size > 0 ? msg.size : 0,
+              side: '',
+              timestamp: typeof msg.timestamp === 'number' ? msg.timestamp : Date.now(),
+            })
+          }
+          break
+        case 'connected':
+          opts.onState?.(true)
+          break
+        case 'unsubscribed':
+          break
+        case 'error':
+          opts.onError?.(msg.message ?? 'IBKR 数据源错误')
+          opts.onState?.(false)
+          break
+        default:
+          break
+      }
+    }
+    socket.onclose = () => {
+      opts.onState?.(false)
+      if (stopped) return // 已被手动断开，禁止重连
+      // 指数退避：1s,2s,4s...最大 15s，加随机抖动避免集中重连
+      const delay = Math.min(1000 * 2 ** retries, 15_000) + Math.floor(Math.random() * 300)
+      retries += 1
+      reconnectTimer = window.setTimeout(connect, delay)
+    }
+    socket.onerror = () => { socket?.close() } // close 会触发 onclose → 重连
+  }
+
+  connect()
+
+  return {
+    disconnect: () => {
+      stopped = true // 清理后永不重连，防止旧连接定时器泄漏
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer)
+      socket?.close()
+      socket = null
     },
   }
 }

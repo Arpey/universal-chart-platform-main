@@ -3,7 +3,7 @@ import { computed, ref } from 'vue'
 import type { DataSource, Dom, Interval, Kline, MarketView, Quote, Source, SymbolInfo, Ticker, TradeTick } from '../types'
 import { fetchMarket, fetchSymbols, fetchTickers } from '../services/chartService'
 
-const DEFAULT_SYMBOL: Record<DataSource, string> = { binance: 'BTCUSDT', tradovate: 'NQ', tradefi: 'XAUUSDT' }
+const DEFAULT_SYMBOL: Record<DataSource, string> = { binance: 'BTCUSDT', tradovate: 'NQ', tradefi: 'XAUUSDT', ibkr: 'MES' }
 
 export const useMarketStore = defineStore('market', () => {
   const datasource = ref<DataSource>('binance')
@@ -27,9 +27,14 @@ export const useMarketStore = defineStore('market', () => {
     } catch (e) { error.value = e instanceof Error ? e.message : '加载失败' } finally { loading.value = false }
   }
 
-  /** 拉取交易对列表 + 24h 行情快照（供搜索列表展示）。任一侧失败都清空该侧并记录错误。 */
+  /** 拉取交易对列表 + 24h 行情快照（供搜索列表展示）。任一失败都清空该侧并记录错误。 */
   async function loadUniverse() {
     universeLoading.value = true; universeError.value = ''
+    // IBKR：标的列表由 WebSocket 消息驱动（get_symbols）提供，不走 HTTP universe 接口
+    if (datasource.value === 'ibkr') {
+      universeLoading.value = false
+      return
+    }
     try {
       // 两个接口相互独立：tickers 失败不影响 symbols 列表展示
       const [s, t] = await Promise.allSettled([fetchSymbols(datasource.value), fetchTickers(datasource.value)])
@@ -63,7 +68,7 @@ export const useMarketStore = defineStore('market', () => {
   function setDatasource(next: DataSource) {
     if (datasource.value === next) return
     datasource.value = next
-    // 分类与底层数据源保持同步（tradovate 不在分类切换器内，保持当前分类不变）
+    // 分类与底层数据源保持同步（tradovate / ibkr 不在分类切换器内，保持当前分类不变）
     if (next === 'tradefi') currentSource.value = 'tradefi'
     else if (next === 'binance') currentSource.value = 'binance'
     symbol.value = DEFAULT_SYMBOL[next]
@@ -76,8 +81,27 @@ export const useMarketStore = defineStore('market', () => {
     symbols.value = []
     tickers.value = []
     universeError.value = ''
-    if (next !== 'tradovate' && view.value !== 'candlestick') view.value = 'candlestick'
+    // IBKR 仅支持逐笔 tick 行情，强制切到 Tick 视图
+    if (next === 'ibkr') view.value = 'tick'
+    else if (next !== 'tradovate' && view.value !== 'candlestick') view.value = 'candlestick'
     void loadUniverse()
+  }
+
+  /** 接收 IBKR 消息驱动的 CME 期货标的列表（get_symbols 响应），归一化到 SymbolInfo。 */
+  function applySymbols(list: Array<{ symbol: string; name?: string; exchange?: string; secType?: string }>) {
+    if (!Array.isArray(list)) return
+    symbols.value = list.map((s) => ({
+      symbol: s.symbol,
+      baseAsset: s.symbol,
+      quoteAsset: 'USD',
+      name: s.name,
+      exchange: s.exchange,
+      secType: s.secType,
+    }))
+    // IBKR 标的无 24h 行情快照：清空 tickers，避免残留上一数据源行情
+    tickers.value = []
+    universeError.value = ''
+    universeLoading.value = false
   }
 
   /** 切换图表视图（K 线 / 盘口 / Tick 流）。 */
@@ -153,5 +177,6 @@ export const useMarketStore = defineStore('market', () => {
     quote, dom, trades, domConnected,
     load, loadUniverse, setDatasource, switchSource, setView, setSymbol,
     update, applyHist, setQuote, setDom, addTrade, setPrice,
+    applySymbols,
   }
 })

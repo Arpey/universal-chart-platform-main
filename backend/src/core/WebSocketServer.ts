@@ -3,6 +3,7 @@ import { WebSocketServer, type WebSocket } from 'ws'
 import { MarketManager } from './MarketManager'
 import type { MarketDataAdapter } from '../types/adapter'
 import type { Interval } from '../types/kline'
+import { IBKR_CME_SYMBOLS } from '../services/IBKRClient'
 import { config } from '../utils/config'
 import { logger } from '../utils/logger'
 
@@ -35,7 +36,10 @@ export function attachMarketSocket(server: Server, manager = new MarketManager()
   wss.on('close', () => clearInterval(heartbeat)) // 关闭时清理定时器，防止泄漏
 
   wss.on('connection', (client, request) => {
-    const query = new URL(request.url ?? '', 'http://localhost').searchParams
+    const requestUrl = new URL(request.url ?? '', 'http://localhost')
+    // 无查询参数 = 纯消息驱动控制通道（IBKR get_symbols / subscribe），不建立 URL 订阅
+    const isControlChannel = requestUrl.search === ''
+    const query = requestUrl.searchParams
     const symbol = query.get('symbol') ?? 'BTCUSDT'
     const interval = (query.get('interval') ?? '1m') as Interval
     const datasource = query.get('source') ?? query.get('datasource') ?? 'binance'
@@ -62,6 +66,12 @@ export function attachMarketSocket(server: Server, manager = new MarketManager()
       const action = String(msg.action ?? '').toLowerCase()
       const source = String(msg.source ?? '')
       if (source !== 'IBKR') return // 当前仅支持 IBKR 数据源的消息订阅
+
+      // 获取 CME 期货标的列表（前端搜索弹窗选择 IBKR 时调用）
+      if (action === 'get_symbols') {
+        send({ type: 'symbols', source: 'IBKR', data: IBKR_CME_SYMBOLS })
+        return
+      }
 
       const symbol = String(msg.symbol ?? '').toUpperCase().trim()
       if (!/^[A-Z0-9]{1,20}$/.test(symbol)) {
@@ -115,6 +125,13 @@ export function attachMarketSocket(server: Server, manager = new MarketManager()
     })
 
     try {
+      // 无查询参数 = 纯消息驱动控制通道：仅等待 { action: "get_symbols" | "subscribe" } JSON 消息
+      if (isControlChannel) {
+        aliveClients.add(client)
+        client.on('pong', () => aliveClients.add(client))
+        logger.info('WebSocket 控制通道连接（IBKR 消息驱动）')
+        return
+      }
       // 参数白名单校验：防止构造非法流名导致静默无数据
       if (
         !/^[A-Z0-9]{1,20}$/.test(symbol)

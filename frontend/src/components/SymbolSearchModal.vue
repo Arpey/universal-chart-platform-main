@@ -4,13 +4,14 @@ import { useMarketStore } from '../stores/marketStore'
 import { useSymbolRows } from '../composables/useSymbolRows'
 import type { SymbolRow } from '../types'
 
-type SourceTabId = 'all' | 'binance' | 'tradovate' | 'stocks' | 'forex'
+type SourceTabId = 'all' | 'binance' | 'tradovate' | 'ibkr' | 'stocks' | 'forex'
 
-/** 数据源/分类 Tab：Binance 与 Tradovate 为真实数据源，其余为占位（空状态提示）。 */
+/** 数据源/分类 Tab：Binance / Tradovate / IBKR 为真实数据源，其余为占位（空状态提示）。 */
 const TABS: { id: SourceTabId; label: string; hint?: string }[] = [
   { id: 'all', label: 'All' },
   { id: 'binance', label: 'Binance' },
   { id: 'tradovate', label: 'Tradovate' },
+  { id: 'ibkr', label: 'IBKR' },
   { id: 'stocks', label: 'Stocks', hint: '暂无股票数据源接入' },
   { id: 'forex', label: 'Forex', hint: '暂无外汇数据源接入' },
 ]
@@ -34,16 +35,18 @@ function pickTab(id: SourceTabId) {
   activeTab.value = id
   if (id === 'tradovate' && market.datasource !== 'tradovate') market.setDatasource('tradovate')
   else if (id === 'binance' && market.datasource !== 'binance') market.switchSource('binance')
+  else if (id === 'ibkr' && market.datasource !== 'ibkr') market.setDatasource('ibkr')
 }
 
-/** 按 Tab + 关键字（代码 symbol / 名称 baseAsset）过滤。 */
+/** 按 Tab + 关键字（代码 symbol / 名称 baseAsset / 全名 name）过滤。 */
 const filtered = computed<SymbolRow[]>(() => {
   if (isEmptyTab.value) return []
   let list = rows.value
   if (activeTab.value === 'binance') list = list.filter((r) => r.source === 'binance')
   if (activeTab.value === 'tradovate') list = list.filter((r) => r.source === 'tradovate')
+  if (activeTab.value === 'ibkr') list = list.filter((r) => r.source === 'ibkr')
   const q = query.value.trim().toUpperCase()
-  if (q) list = list.filter((r) => r.symbol.includes(q) || r.baseAsset.includes(q))
+  if (q) list = list.filter((r) => r.symbol.includes(q) || r.baseAsset.includes(q) || (r.name ?? '').toUpperCase().includes(q))
   return list
 })
 
@@ -149,6 +152,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 
         <div v-if="market.universeError" class="list-state error">⚠️ {{ market.universeError }}</div>
         <div v-else-if="market.universeLoading && !rows.length" class="list-state loading">加载标的…</div>
+        <div v-else-if="activeTab === 'ibkr' && !sorted.length" class="list-state muted">正在加载 IBKR CME 期货标的…</div>
         <div v-else-if="isEmptyTab" class="list-state muted">{{ TABS.find((t) => t.id === activeTab)?.hint }}</div>
         <div v-else-if="!sorted.length" class="list-state muted">没有匹配的标的</div>
         <ul v-else ref="listRef" class="symbol-list">
@@ -164,7 +168,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
               <em>{{ row.baseAsset.slice(0, 4).toUpperCase() }}</em>
               <span class="sym-text">
                 <b>{{ row.symbol }}</b>
-                <small>{{ row.baseAsset }}</small>
+                <small>{{ row.name ?? row.baseAsset }}</small>
               </span>
             </span>
             <span class="sym-badge">{{ row.source.toUpperCase() }}</span>

@@ -1,5 +1,5 @@
 import { BaseAdapter } from './BaseAdapter'
-import { IBKRClient, IBKR_SYMBOLS } from '../services/IBKRClient'
+import { IBKRClient, IBKR_CME_SYMBOLS } from '../services/IBKRClient'
 import type { MarketDataAdapter, SymbolInfo } from '../types/adapter'
 import type { Interval, Kline } from '../types/kline'
 import type { Ticker } from '../types/market'
@@ -25,7 +25,14 @@ export class IBKRAdapter extends BaseAdapter implements MarketDataAdapter {
   }
 
   getSymbols(): Promise<SymbolInfo[]> {
-    return Promise.resolve(IBKR_SYMBOLS.map((symbol) => ({ symbol, baseAsset: symbol, quoteAsset: 'USD' })))
+    return Promise.resolve(IBKR_CME_SYMBOLS.map((s) => ({
+      symbol: s.symbol,
+      baseAsset: s.symbol,
+      quoteAsset: 'USD',
+      name: s.name,
+      exchange: s.exchange,
+      secType: s.secType,
+    })))
   }
 
   async getTicker(symbol: string): Promise<Ticker> {
@@ -34,9 +41,9 @@ export class IBKRAdapter extends BaseAdapter implements MarketDataAdapter {
   }
 
   async getAllTickers(): Promise<Ticker[]> {
-    return IBKR_SYMBOLS.map((symbol) => {
-      const tick = this.client.getLast(symbol)
-      return { symbol, price: tick?.price ?? 0, change24h: 0, volume24h: 0, updatedAt: tick?.timestamp ?? Date.now() }
+    return IBKR_CME_SYMBOLS.map((s) => {
+      const tick = this.client.getLast(s.symbol)
+      return { symbol: s.symbol, price: tick?.price ?? 0, change24h: 0, volume24h: 0, updatedAt: tick?.timestamp ?? Date.now() }
     })
   }
 

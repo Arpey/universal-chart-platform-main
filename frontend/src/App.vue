@@ -9,7 +9,7 @@ import StatusBar from './components/StatusBar.vue'
 import IndicatorsModal from './components/IndicatorsModal.vue'
 import DataSourceSwitcher from './components/DataSourceSwitcher.vue'
 import { useMarketStore } from './stores/marketStore'
-import { connectMarket, type WsDataType } from './services/wsService'
+import { connectMarket, connectIBKR, type WsDataType } from './services/wsService'
 import { useCountdown } from './composables/useCountdown'
 import type { MarketView } from './types'
 import type { DrawKind } from './types/drawing'
@@ -25,29 +25,38 @@ const clearSignal = ref(0)
 const toolActive = ref(false)
 let disconnect = () => {}
 
-/** 顶部/状态栏数据源标签：Tradovate / Tradefi 分类 / Binance。 */
+/** 顶部/状态栏数据源标签：Tradovate / IBKR / Tradefi 分类 / Binance。 */
 const currentSourceLabel = computed(() => {
   if (market.datasource === 'tradovate') return 'Tradovate'
+  if (market.datasource === 'ibkr') return 'IBKR'
   return market.currentSource === 'tradefi' ? 'Tradefi' : 'Binance'
 })
 
-/** 图表视图选项（盘口/Tick 仅 Tradovate 支持） */
+/** 图表视图选项（盘口仅 Tradovate；Tick 流 Tradovate / IBKR） */
 const VIEWS: { id: MarketView; label: string; hint: string }[] = [
   { id: 'candlestick', label: 'K线', hint: 'K 线图 / 蜡烛图' },
-  { id: 'dom', label: '盘口', hint: '盘口订单簿（Depth of Market）' },
-  { id: 'tick', label: 'Tick', hint: '逐笔成交流（Time & Sales）' },
+  { id: 'dom', label: '盘口', hint: '盘口订单簿（Depth of Market，仅 Tradovate）' },
+  { id: 'tick', label: 'Tick', hint: '逐笔成交流（Time & Sales，Tradovate / IBKR）' },
 ]
 const viewDataTypes: Record<MarketView, WsDataType> = { candlestick: 'kline', dom: 'dom', tick: 'tick' }
 const isTradovate = computed(() => market.datasource === 'tradovate')
+const isIBKR = computed(() => market.datasource === 'ibkr')
 
-/** 顶部标的徽标：Tradovate 合约名去掉月份代码（NQU6 → NQ）。 */
+/** 视图可用性：K 线全数据源；盘口仅 Tradovate；Tick 流 Tradovate / IBKR。 */
+function viewSupported(v: MarketView): boolean {
+  if (v === 'candlestick') return true
+  if (v === 'dom') return isTradovate.value
+  return isTradovate.value || isIBKR.value // tick
+}
+
+/** 顶部标的徽标：期货合约名去掉月份代码（NQU6 → NQ）；IBKR 根合约（MES/ES）原样展示。 */
 const symbolRoot = computed(() => {
-  if (isTradovate.value) return market.symbol.replace(/[FGHJKMNQUVXZ]\d$/, '') || market.symbol
+  if (isTradovate.value || isIBKR.value) return market.symbol.replace(/[FGHJKMNQUVXZ]\d$/, '') || market.symbol
   return market.symbol.slice(0, market.symbol.indexOf('USDT')).slice(0, 4) || market.symbol
 })
 
 function pickView(v: MarketView) {
-  if (v !== 'candlestick' && !isTradovate.value) return // 非 Tradovate 仅支持 K 线
+  if (!viewSupported(v)) return // 当前数据源不支持的视图
   market.setView(v)
 }
 
@@ -117,6 +126,17 @@ function clearDrawings() {
 
 function refresh() {
   disconnect()
+  // IBKR：消息驱动订阅（控制通道连接后发送 get_symbols / subscribe JSON 消息），不走 URL 参数流
+  if (market.datasource === 'ibkr') {
+    disconnect = connectIBKR({
+      symbol: market.symbol,
+      onSymbols: market.applySymbols,
+      onTick: market.addTrade,
+      onState: (value) => { connected.value = value },
+      onError: (message) => { market.error = message },
+    }).disconnect
+    return
+  }
   void market.load()
   disconnect = connectMarket(market.symbol, market.interval, {
     source: market.datasource,
@@ -172,8 +192,8 @@ function formatPrice(value?: number) {
             v-for="v in VIEWS"
             :key="v.id"
             class="view-btn"
-            :class="{ active: market.view === v.id, disabled: v.id !== 'candlestick' && !isTradovate }"
-            :title="v.id !== 'candlestick' && !isTradovate ? '仅 Tradovate 数据源支持' : v.hint"
+            :class="{ active: market.view === v.id, disabled: !viewSupported(v.id) }"
+            :title="viewSupported(v.id) ? v.hint : '该视图仅 Tradovate / IBKR 数据源支持'"
             @click="pickView(v.id)"
           >{{ v.label }}</button>
         </div>

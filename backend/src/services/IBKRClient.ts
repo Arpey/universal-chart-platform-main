@@ -22,16 +22,36 @@ type TickListener = (tick: IBKRTick) => void
 type StatusListener = (connected: boolean, error?: Error) => void
 
 /**
- * 支持的 CME 期货根合约。
+ * CME 期货标的配置（单一数据源：搜索弹窗 get_symbols / /api/symbols 返回，与订阅契约共用）。
  * 不指定合约月份时，IB Gateway / TWS 会自动解析为当前近月合约。
  */
-const CONTRACTS: Record<string, Contract> = {
-  MES: { symbol: 'MES', secType: SecType.FUT, exchange: 'CME', currency: 'USD' },
-  MNQ: { symbol: 'MNQ', secType: SecType.FUT, exchange: 'CME', currency: 'USD' },
-  MGC: { symbol: 'MGC', secType: SecType.FUT, exchange: 'COMEX', currency: 'USD' },
+export interface IBKRContractMeta {
+  symbol: string
+  name: string
+  exchange: string
+  secType: string
 }
 
-export const IBKR_SYMBOLS = Object.keys(CONTRACTS)
+export const IBKR_CME_SYMBOLS: IBKRContractMeta[] = [
+  { symbol: 'MES', name: 'Micro E-mini S&P 500', exchange: 'CME', secType: 'FUT' },
+  { symbol: 'MNQ', name: 'Micro E-mini Nasdaq 100', exchange: 'CME', secType: 'FUT' },
+  { symbol: 'MYM', name: 'Micro E-mini Dow Jones', exchange: 'CBOT', secType: 'FUT' },
+  { symbol: 'M2K', name: 'Micro E-mini Russell 2000', exchange: 'CME', secType: 'FUT' },
+  { symbol: 'MGC', name: 'Micro Gold', exchange: 'COMEX', secType: 'FUT' },
+  { symbol: 'MCL', name: 'Micro WTI Crude Oil', exchange: 'NYMEX', secType: 'FUT' },
+  { symbol: 'ES',  name: 'E-mini S&P 500', exchange: 'CME', secType: 'FUT' },
+  { symbol: 'NQ',  name: 'E-mini Nasdaq 100', exchange: 'CME', secType: 'FUT' },
+]
+
+/** 订阅契约：由 IBKR_CME_SYMBOLS 派生，保证搜索列表与订阅支持范围始终一致。 */
+const CONTRACTS: Record<string, Contract> = Object.fromEntries(
+  IBKR_CME_SYMBOLS.map((s): [string, Contract] => [
+    s.symbol,
+    { symbol: s.symbol, secType: s.secType as SecType, exchange: s.exchange, currency: 'USD' },
+  ]),
+)
+
+export const IBKR_SYMBOLS = IBKR_CME_SYMBOLS.map((s) => s.symbol)
 
 interface ActiveSubscription {
   symbol: string

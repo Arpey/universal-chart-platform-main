@@ -6,6 +6,12 @@ export interface SymbolInfo {
   symbol: string
   baseAsset: string
   quoteAsset: string
+  /** 合约全名（IBKR CME 期货等数据源提供，如 "Micro E-mini S&P 500"） */
+  name?: string
+  /** 交易所（IBKR 等数据源提供，如 CME / CBOT / COMEX / NYMEX） */
+  exchange?: string
+  /** 证券类型（IBKR 等数据源提供，如 FUT） */
+  secType?: string
 }
 
 export interface MarketAdapter {

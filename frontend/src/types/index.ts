@@ -1,13 +1,13 @@
 export type Interval = '1m' | '5m' | '15m' | '1h' | '4h' | '1d'
-/** 数据源：binance（默认）/ tradovate（美股指/期货） */
-export type DataSource = 'binance' | 'tradovate' | 'tradefi'
+/** 数据源：binance（默认）/ tradovate（美股指/期货）/ ibkr（CME 期货逐笔行情） */
+export type DataSource = 'binance' | 'tradovate' | 'tradefi' | 'ibkr'
 /** 分类（切换器）：全部合约 / Tradefi（基于币安 U 本位白名单） */
 export type Source = 'binance' | 'tradefi'
 /** 图表视图：K 线 / 盘口订单簿 / Tick 流 */
 export type MarketView = 'candlestick' | 'dom' | 'tick'
 export interface Kline { time: number; open: number; high: number; low: number; close: number; volume: number }
 export interface Ticker { symbol: string; price: number; change24h: number; volume24h: number; updatedAt: number }
-export interface SymbolInfo { symbol: string; baseAsset: string; quoteAsset: string }
+export interface SymbolInfo { symbol: string; baseAsset: string; quoteAsset: string; name?: string; exchange?: string; secType?: string }
 /** 搜索列表行：合并交易对基本信息、数据源标记与实时行情 */
 export interface SymbolRow extends SymbolInfo { source: string; price: number; change24h: number; volume24h: number }
 
