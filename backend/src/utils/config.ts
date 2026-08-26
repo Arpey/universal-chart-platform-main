@@ -37,6 +37,15 @@ export const config = {
     mdWsUrl: (process.env.TRADOVATE_ENV ?? 'demo').toLowerCase() === 'live' ? 'wss://md.tradovateapi.com/v1/websocket' : 'wss://demo-md.tradovateapi.com/v1/websocket',
     // Tradovate 专用代理；留空则直连（Tradovate 不受地区封锁，一般无需代理）。可复用 HTTPS_PROXY 的值。
     proxy: process.env.TRADOVATE_PROXY ?? ''
+  },
+  // 数据源：IBKR（盈透证券，CME 期货行情）
+  // - 连接本地 IB Gateway / TWS 的 API 端口（IB Gateway 模拟账户默认 4002）；
+  // - 连接成功后自动启用延迟行情（MarketDataType.DELAYED = 3），未付费订阅也可免费获取测试数据。
+  ibkr: {
+    enabled: process.env.IBKR_ENABLED === 'true',
+    host: process.env.IBKR_HOST ?? '127.0.0.1',
+    port: Number(process.env.IBKR_PORT ?? 4002),
+    clientId: Number(process.env.IBKR_CLIENT_ID ?? 10)
   }
 }
 

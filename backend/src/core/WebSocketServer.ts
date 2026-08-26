@@ -3,6 +3,7 @@ import { WebSocketServer, type WebSocket } from 'ws'
 import { MarketManager } from './MarketManager'
 import type { MarketDataAdapter } from '../types/adapter'
 import type { Interval } from '../types/kline'
+import { config } from '../utils/config'
 import { logger } from '../utils/logger'
 
 const INTERVALS = ['1m', '5m', '15m', '1h', '4h', '1d'] as const
@@ -13,6 +14,9 @@ type WsDataType = (typeof DATA_TYPES)[number]
 
 export function attachMarketSocket(server: Server, manager = new MarketManager()) {
   const wss = new WebSocketServer({ server, path: '/ws' })
+
+  // IBKR 适配器单例（IBKR_ENABLED=true 时启用；连接为懒建立，首次订阅消息才连本地 IB Gateway / TWS）
+  const ibkrAdapter: MarketDataAdapter | null = config.ibkr.enabled ? manager.resolve('ibkr') : null
 
   // 服务器心跳：每 30s ping 所有客户端，未回 pong 的 terminate。
   // 浏览器会自动回复 pong；前端收到 close 后自动重连，形成闭环。
@@ -38,13 +42,66 @@ export function attachMarketSocket(server: Server, manager = new MarketManager()
     const dataType = (query.get('dataType') ?? 'kline') as WsDataType
 
     let unsubscribe: (() => void) | null = null
+    // IBKR 消息驱动订阅集合：symbol -> 取消函数（client 断开时统一清理）
+    const ibkrSubscriptions = new Map<string, () => void>()
     const cleanup = () => {
       unsubscribe?.() // 幂等：只清理一次
       unsubscribe = null
+      for (const unsub of ibkrSubscriptions.values()) unsub()
+      ibkrSubscriptions.clear()
     }
     const send = (payload: unknown) => {
       if (client.readyState === client.OPEN) client.send(JSON.stringify(payload))
     }
+
+    // 消息驱动订阅：处理前端 JSON 消息，例如 {"action": "subscribe", "source": "IBKR", "symbol": "MES"}
+    client.on('message', (raw) => {
+      let msg: { action?: unknown; source?: unknown; symbol?: unknown } | null = null
+      try { msg = JSON.parse(raw.toString()) } catch { return } // 忽略非 JSON 消息
+      if (!msg) return
+      const action = String(msg.action ?? '').toLowerCase()
+      const source = String(msg.source ?? '')
+      if (source !== 'IBKR') return // 当前仅支持 IBKR 数据源的消息订阅
+
+      const symbol = String(msg.symbol ?? '').toUpperCase().trim()
+      if (!/^[A-Z0-9]{1,20}$/.test(symbol)) {
+        send({ type: 'error', message: '非法的 IBKR 合约代码' })
+        return
+      }
+
+      if (action === 'subscribe') {
+        const adapter = ibkrAdapter
+        if (!adapter?.subscribeTick) {
+          send({ type: 'error', message: 'IBKR 数据源未启用（请检查 IBKR_ENABLED 配置）' })
+          return
+        }
+        if (ibkrSubscriptions.has(symbol)) return // 同一 client 重复订阅去重
+        // 连接预检：等待本地 IB Gateway / TWS 就绪，失败时向前端返回明确错误
+        const preflight = adapter.ping?.() ?? Promise.resolve()
+        preflight
+          .then(() => {
+            if (client.readyState !== client.OPEN) return
+            if (ibkrSubscriptions.has(symbol)) return
+            const unsub = adapter.subscribeTick!(
+              symbol,
+              (tick) => send(tick), // TickerMessage 直接广播：{ type: 'ticker', source: 'IBKR', ... }
+              (message) => send({ type: 'error', message }),
+            )
+            ibkrSubscriptions.set(symbol, unsub)
+            send({ type: 'connected', source: 'IBKR', symbol, dataType: 'tick' })
+          })
+          .catch((err) => {
+            send({ type: 'error', message: err instanceof Error ? err.message : 'IBKR 数据源连接失败' })
+          })
+      } else if (action === 'unsubscribe') {
+        const unsub = ibkrSubscriptions.get(symbol)
+        if (unsub) {
+          unsub()
+          ibkrSubscriptions.delete(symbol)
+          send({ type: 'unsubscribed', source: 'IBKR', symbol })
+        }
+      }
+    })
 
     // 尽早注册 error/close 处理器，任何提前 return / 抛错路径都能正确清理与关闭
     client.on('error', (error) => {

@@ -1,5 +1,5 @@
 import type { Interval, Kline } from './kline'
-import type { DomData, QuoteData, Ticker, TradeData } from './market'
+import type { DomData, QuoteData, Ticker, TickerMessage, TradeData } from './market'
 
 /** 交易对/合约基本信息（前端搜索列表用） */
 export interface SymbolInfo {
@@ -29,7 +29,7 @@ export interface MarketAdapter {
   /** 盘口订单簿流（可选） */
   subscribeDOM?(symbol: string, onDom: (data: DomData) => void, onError?: (message: string) => void): () => void
   /** 逐笔成交流（可选） */
-  subscribeTick?(symbol: string, onTick: (data: TradeData) => void, onError?: (message: string) => void): () => void
+  subscribeTick?(symbol: string, onTick: (data: TradeData | TickerMessage) => void, onError?: (message: string) => void): () => void
 }
 
 /** 支持交易对/合约列表与批量行情的适配器（当前两个数据源均实现） */

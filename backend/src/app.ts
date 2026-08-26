@@ -44,6 +44,9 @@ app.get('/api/datasources', (_req, res) => res.json({
     ...(config.tradovate.enabled
       ? [{ id: 'tradovate', label: 'Tradovate', markets: ['kline', 'quote', 'dom', 'tick'] }]
       : []),
+    ...(config.ibkr.enabled
+      ? [{ id: 'ibkr', label: 'IBKR (CME Futures)', markets: ['tick'] }]
+      : []),
   ],
 }))
 app.get('/api/health', (_req, res) => res.json({ status: 'ok' }))

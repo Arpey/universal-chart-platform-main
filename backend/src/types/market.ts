@@ -32,3 +32,13 @@ export interface TradeData {
   side: 'Buy' | 'Sell' | ''
   timestamp: number
 }
+
+/** 通用 ticker 行情消息（IBKR 等数据源实时行情统一输出格式） */
+export interface TickerMessage {
+  type: 'ticker'
+  source: string
+  symbol: string
+  price: number
+  size: number
+  timestamp: number
+}
