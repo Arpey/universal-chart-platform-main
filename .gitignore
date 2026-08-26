@@ -12,3 +12,4 @@ src/**/*.ts.js
 src/**/*.js.js
 .vite/
 
+test_tradovate.py
