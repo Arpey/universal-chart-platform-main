@@ -15,7 +15,7 @@ export interface SymbolInfo {
 }
 
 export interface MarketAdapter {
-  getKlines(symbol: string, interval: Interval, limit: number): Promise<Kline[]>
+  getKlines(symbol: string, interval: Interval, limit: number, endDateTime?: number): Promise<Kline[]>
   getTicker(symbol: string): Promise<Ticker>
   /**
    * 订阅 K 线增量。
@@ -34,8 +34,10 @@ export interface MarketAdapter {
   subscribeQuote?(symbol: string, onQuote: (data: QuoteData) => void, onError?: (message: string) => void): () => void
   /** 盘口订单簿流（可选） */
   subscribeDOM?(symbol: string, onDom: (data: DomData) => void, onError?: (message: string) => void): () => void
-  /** 逐笔成交流（可选） */
-  subscribeTick?(symbol: string, onTick: (data: TradeData | TickerMessage) => void, onError?: (message: string) => void): () => void
+  /** 逐笔成交流（可选，IBKR 需先解析合约故为异步） */
+  subscribeTick?(symbol: string, onTick: (data: TradeData | TickerMessage) => void, onError?: (message: string) => void): (() => void) | Promise<() => void>
+  /** 实时 K 线流（可选，IBKR reqRealTimeBars → { symbol, time, open, high, low, close, volume }） */
+  subscribeBar?(symbol: string, interval: Interval, onKline: (kline: Kline) => void, onError?: (message: string) => void): (() => void) | Promise<() => void>
 }
 
 /** 支持交易对/合约列表与批量行情的适配器（当前两个数据源均实现） */
@@ -44,4 +46,6 @@ export interface MarketDataAdapter extends MarketAdapter {
   getAllTickers(): Promise<Ticker[]>
   /** 连通性预检（Tradovate 鉴权校验；可选） */
   ping?(): Promise<void>
+  /** 底层连接状态订阅（可选，IBKR 断线/重连时广播给 WebSocket 客户端） */
+  onStatus?(listener: (connected: boolean, error?: Error) => void): () => void
 }

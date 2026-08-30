@@ -7,6 +7,21 @@ const nodeEnv = process.env.NODE_ENV ?? 'development'
 loadDotEnv({ override: true })
 loadDotFile({ path: `${__dirname}/../../config/${nodeEnv}.env`, override: false })
 
+/**
+ * 解析 IBKR clientId：
+ * - 显式配置了正整数（如 IBKR_CLIENT_ID=42）→ 尊重显式配置；
+ * - 未配置 / 0 / 非法值 → 随机 1..1000。TWS/IB Gateway 每个 clientId 只允许一个 API 连接，
+ *   固定 ID（尤其 0 或 10）极易与其他客户端/旧进程冲突，被 Error 326（客户号码已被使用）拒连。
+ */
+function resolveIBKRClientId(): number {
+  const raw = process.env.IBKR_CLIENT_ID
+  if (raw !== undefined && raw.trim() !== '') {
+    const parsed = Number(raw)
+    if (Number.isInteger(parsed) && parsed > 0) return parsed
+  }
+  return Math.floor(Math.random() * 1000) + 1
+}
+
 export const config = {
   port: Number(process.env.PORT ?? 3001),
   corsOrigin: process.env.CORS_ORIGIN ?? 'http://localhost:5173',
@@ -39,13 +54,16 @@ export const config = {
     proxy: process.env.TRADOVATE_PROXY ?? ''
   },
   // 数据源：IBKR（盈透证券，CME 期货行情）
-  // - 连接本地 IB Gateway / TWS 的 API 端口（IB Gateway 模拟账户默认 4002）；
+  // - 连接本地 IB Gateway / TWS 的 API 端口（默认 4001，可用 IBKR_PORT 覆盖；IB Gateway 实盘 4001 / 模拟 4002）；
   // - 连接成功后自动启用延迟行情（MarketDataType.DELAYED = 3），未付费订阅也可免费获取测试数据。
   ibkr: {
     enabled: process.env.IBKR_ENABLED === 'true',
+    // 显式绑定 127.0.0.1，避免 localhost 解析为 IPv6 ::1 导致 TWS/IB Gateway 连接被拒
     host: process.env.IBKR_HOST ?? '127.0.0.1',
-    port: Number(process.env.IBKR_PORT ?? 4002),
-    clientId: Number(process.env.IBKR_CLIENT_ID ?? 10)
+    port: Number(process.env.IBKR_PORT ?? 4001),
+    clientId: resolveIBKRClientId(),
+    // IBKR_DEBUG=true 时输出协议级 sent/received/result 日志，便于握手排障
+    debug: process.env.IBKR_DEBUG === 'true'
   }
 }
 

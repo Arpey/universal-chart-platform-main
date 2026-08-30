@@ -9,7 +9,7 @@ import StatusBar from './components/StatusBar.vue'
 import IndicatorsModal from './components/IndicatorsModal.vue'
 import DataSourceSwitcher from './components/DataSourceSwitcher.vue'
 import { useMarketStore } from './stores/marketStore'
-import { connectMarket, connectIBKR, type WsDataType } from './services/wsService'
+import { connectMarket, connectIBKR, type WsDataType, type IBKRConnection } from './services/wsService'
 import { useCountdown } from './composables/useCountdown'
 import type { MarketView } from './types'
 import type { DrawKind } from './types/drawing'
@@ -24,6 +24,13 @@ const activeTool = ref<DrawKind>('cursor')
 const clearSignal = ref(0)
 const toolActive = ref(false)
 let disconnect = () => {}
+/** 当前 IBKR 控制通道连接（用于分页加载更早历史 K 线）。 */
+const ibkrConnection = ref<IBKRConnection | null>(null)
+
+/** IBKR 分页：图表滚动到最左侧时，以最旧 bar 时间戳向后端请求更早历史。 */
+function loadMoreIBKRHistory(endTime: number) {
+  ibkrConnection.value?.loadMoreHistory(endTime)
+}
 
 /** 顶部/状态栏数据源标签：Tradovate / IBKR / Tradefi 分类 / Binance。 */
 const currentSourceLabel = computed(() => {
@@ -128,13 +135,18 @@ function refresh() {
   disconnect()
   // IBKR：消息驱动订阅（控制通道连接后发送 get_symbols / subscribe JSON 消息），不走 URL 参数流
   if (market.datasource === 'ibkr') {
-    disconnect = connectIBKR({
+    const conn = connectIBKR({
       symbol: market.symbol,
+      interval: market.interval,
       onSymbols: market.applySymbols,
       onTick: market.addTrade,
+      onKline: market.update,
+      onHist: market.applyHist,
       onState: (value) => { connected.value = value },
       onError: (message) => { market.error = message },
-    }).disconnect
+    })
+    ibkrConnection.value = conn
+    disconnect = conn.disconnect
     return
   }
   void market.load()
@@ -249,6 +261,7 @@ function formatPrice(value?: number) {
           :magnet="magnet"
           :stay-in-mode="stayInMode"
           :clear-signal="clearSignal"
+          :on-load-more-history="market.datasource === 'ibkr' ? loadMoreIBKRHistory : undefined"
           @tool-state="toolActive = $event"
           @drawing-done="onDrawingDone"
         />

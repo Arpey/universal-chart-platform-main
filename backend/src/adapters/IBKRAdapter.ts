@@ -9,12 +9,13 @@ import { logger } from '../utils/logger'
 /**
  * IBKR（盈透证券）数据源适配器。
  *
- * 内部管理 IBKRClient 实例，将 IBKR 的 tickPrice / tickSize / tickByTickAllLast 行情
- * 统一转换为项目通用格式：
- *   { type: 'ticker', source: 'IBKR', symbol, price, size, timestamp }
- * 并通过 subscribeTick 注册的回调实时输出（供 WebSocketServer 广播给前端）。
+ * 内部管理 IBKRClient 实例，将 IBKR 的行情统一转换为项目通用格式：
+ * - tickPrice / tickSize / tickByTickAllLast → { type: 'ticker', source: 'IBKR', symbol, price, size, timestamp }
+ * - reqHistoricalData 历史 K 线 → Kline[]（REST / WS 全量快照）
+ * - reqRealTimeBars 实时 K 线 → { symbol, time, open, high, low, close, volume }（WS 增量广播）
  *
- * 当前仅支持 tick 实时行情（延迟数据免费），K 线订阅暂不支持。
+ * 通过 subscribeTick / subscribeBar 注册的回调实时输出（供 WebSocketServer 广播给前端）。
+ * 延迟行情（MarketDataType.DELAYED）免费可用，未付费订阅也能获取测试数据。
  */
 export class IBKRAdapter extends BaseAdapter implements MarketDataAdapter {
   private readonly client = new IBKRClient()
@@ -47,35 +48,48 @@ export class IBKRAdapter extends BaseAdapter implements MarketDataAdapter {
     })
   }
 
-  async getKlines(_symbol: string, _interval: Interval, _limit: number): Promise<Kline[]> {
-    logger.warn('[IBKR] 暂不支持 K 线订阅（仅提供 tick 实时行情）')
-    return []
+  async getKlines(symbol: string, interval: Interval, limit = 300, endDateTime?: number): Promise<Kline[]> {
+    // reqHistoricalData：合约参数（Symbol/SecType/Exchange/Currency）由 IBKRClient.CONTRACTS 统一维护；
+    // 内置默认超时（15s），防止前端无限等待。endDateTime 用于分页拉取更早数据。
+    return this.client.getHistoricalKlines(symbol, interval, limit, undefined, endDateTime)
   }
 
+  /**
+   * K 线订阅（与 URL 参数流的 kline 协议兼容）：
+   * - onHist：reqHistoricalData 一次性全量历史（300 根）；
+   * - onKline：reqRealTimeBars 实时增量（TWS 固定 5 秒 bar，延迟行情账户可能被拒，仅提示）。
+   */
   subscribe(
-    _symbol: string,
-    _interval: Interval,
-    _onKline: (kline: Kline) => void,
-    _onHist?: (klines: Kline[]) => void,
+    symbol: string,
+    interval: Interval,
+    onKline: (kline: Kline) => void,
+    onHist?: (klines: Kline[]) => void,
     onError?: (message: string) => void,
   ): () => void {
-    onError?.('IBKR 数据源暂不支持 K 线订阅，请使用 tick 行情')
-    return () => {}
+    // 全量历史快照（内置超时，失败仅回调 onError）
+    void this.getKlines(symbol, interval, 300)
+      .then((rows) => onHist?.(rows))
+      .catch((err) => onError?.(err instanceof Error ? err.message : String(err)))
+    // 实时增量（subscribeBar 为异步，内部先解析合约）
+    let cancel: (() => void) | null = null
+    void this.subscribeBar(symbol, interval, onKline, onError).then((unsub) => { cancel = unsub })
+    return () => cancel?.()
   }
 
   /**
    * 订阅 tick 行情：内部对 symbol 建立 IBKR 行情订阅，
    * 将统一格式的 TickerMessage 实时回调给调用方（WebSocketServer）。
    */
-  subscribeTick(
+  async subscribeTick(
     symbol: string,
     onTick: (data: TickerMessage) => void,
     onError?: (message: string) => void,
-  ): () => void {
+  ): Promise<() => void> {
     let disposed = false
     let unsubscribeClient: (() => void) | null = null
     try {
-      unsubscribeClient = this.client.subscribeMarketData(symbol)
+      // 内部先解析真实近月合约（reqContractDetails），再 reqMktData / reqTickByTickData
+      unsubscribeClient = await this.client.subscribeMarketData(symbol)
     } catch (err) {
       onError?.(err instanceof Error ? err.message : String(err))
       return () => {}
@@ -89,6 +103,41 @@ export class IBKRAdapter extends BaseAdapter implements MarketDataAdapter {
       unsubscribeListener()
       unsubscribeClient?.()
     }
+  }
+
+  /**
+   * 订阅实时 K 线：底层调用 reqRealTimeBars（TWS 固定 5 秒 bar），
+   * 将 { symbol, time, open, high, low, close, volume } 标准化为 Kline 回调给调用方（WebSocketServer）。
+   */
+  async subscribeBar(
+    symbol: string,
+    _interval: Interval,
+    onKline: (kline: Kline) => void,
+    onError?: (message: string) => void,
+  ): Promise<() => void> {
+    let disposed = false
+    let unsubscribeClient: (() => void) | null = null
+    try {
+      // 内部先解析真实近月合约，再 reqMktData + reqRealTimeBars（TWS 固定 5 秒 bar）
+      unsubscribeClient = await this.client.subscribeMarketData(symbol)
+    } catch (err) {
+      onError?.(err instanceof Error ? err.message : String(err))
+      return () => {}
+    }
+    const unsubscribeListener = this.client.onRealtimeBar((bar) => {
+      if (disposed || bar.symbol !== symbol) return
+      onKline({ time: bar.time, open: bar.open, high: bar.high, low: bar.low, close: bar.close, volume: bar.volume })
+    })
+    return () => {
+      disposed = true
+      unsubscribeListener()
+      unsubscribeClient?.()
+    }
+  }
+
+  /** 监听底层 IB Gateway / TWS 连接状态（供 WebSocketServer 广播给客户端）。 */
+  onStatus(listener: (connected: boolean, error?: Error) => void): () => void {
+    return this.client.onStatus(listener)
   }
 
   /** 关闭底层连接（进程退出时调用）。 */

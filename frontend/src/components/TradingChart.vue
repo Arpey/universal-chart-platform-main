@@ -11,6 +11,7 @@ import {
   type ISeriesApi,
   type LineData,
   type LineWidth,
+  type LogicalRange,
   type UTCTimestamp,
 } from 'lightweight-charts'
 import { CandleCountdownPrimitive } from './CandleCountdownPrimitive'
@@ -39,6 +40,8 @@ const props = defineProps<{
   magnet?: boolean
   stayInMode?: boolean
   clearSignal?: number
+  /** 图表滚动到最左侧已加载 K 线时回调（endTime = 最旧 bar 的 Unix 毫秒），用于 IBKR 分页加载更早历史。 */
+  onLoadMoreHistory?: (endTime: number) => void
 }>()
 
 const emit = defineEmits<{
@@ -82,6 +85,8 @@ let lastLen = 0
 let lastFirstTime = 0
 let disposed = false
 let ro: ResizeObserver | null = null
+let loadMoreGuardTime = 0 // 已触发 load_more 的最旧 bar 时间（避免同一边界重复请求）
+let loadMoreGuardAt = 0 // 上次触发时间戳（节流，防止连续滚动时打爆后端）
 
 // ---------- K 线收盘倒计时 ----------
 const lastTimeSec = computed(() => props.data[props.data.length - 1]?.time)
@@ -165,6 +170,9 @@ onMounted(async () => {
   applyData(props.data, true)
   lastLen = props.data.length
 
+  // 滚动到最左侧已加载 K 线时触发分页加载更早历史（IBKR）
+  chart.timeScale().subscribeVisibleLogicalRangeChange(onVisibleLogicalRangeChange)
+
   syncEmaSeries() // 初始渲染已有指标实例
 
   bindInteraction()
@@ -188,6 +196,7 @@ onBeforeUnmount(() => {
   emaSeriesMap.clear()
   if (chart) {
     chart.applyOptions({ handleScroll: { pressedMouseMove: true } }) // 兜底恢复，防止卸载后图表无法拖拽
+    chart.timeScale().unsubscribeVisibleLogicalRangeChange(onVisibleLogicalRangeChange)
     if (clickHandler) chart.unsubscribeClick(clickHandler)
     if (crosshairHandler) chart.unsubscribeCrosshairMove(crosshairHandler)
     chart.remove()
@@ -238,6 +247,31 @@ function normalizeKlines(data: Kline[]): Kline[] {
 /** 时间戳适配：>= 1e12 视为毫秒（如币安原始 openTime）→ 除以 1000 转秒；否则视为秒直接使用 */
 function toUTCTime(t: number): UTCTimestamp {
   return (t >= 1e12 ? Math.floor(t / 1000) : Math.floor(t)) as UTCTimestamp
+}
+
+/**
+ * 可见范围变化：当图表滚动到最左侧已加载 K 线时，回调 onLoadMoreHistory 触发分页拉取更早数据（IBKR）。
+ * range.from 为可见区第一个 bar 的逻辑索引：<= 0 表示左边界已到达/越过最旧 bar。
+ */
+function onVisibleLogicalRangeChange(range: LogicalRange | null) {
+  if (!range || disposed) return
+  const bars = props.data
+  if (!bars.length || typeof props.onLoadMoreHistory !== 'function') return
+  const oldest = bars[0].time
+  if (typeof oldest !== 'number' || !Number.isFinite(oldest) || oldest <= 0) return
+  // 切换标的/周期后最旧 bar 变新 → 重置边界守卫
+  if (oldest > loadMoreGuardTime) loadMoreGuardTime = 0
+  const now = Date.now()
+  if (
+    typeof range.from === 'number'
+    && range.from <= 0.5 // 左边界已滑到最左侧
+    && oldest !== loadMoreGuardTime // 同一边界只请求一次
+    && now - loadMoreGuardAt > 2000 // 节流
+  ) {
+    loadMoreGuardTime = oldest
+    loadMoreGuardAt = now
+    props.onLoadMoreHistory(oldest)
+  }
 }
 
 /** 强制转为有限数值，避免后端返回字符串/NaN 导致图表异常 */

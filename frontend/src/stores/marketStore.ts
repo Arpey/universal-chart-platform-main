@@ -81,9 +81,8 @@ export const useMarketStore = defineStore('market', () => {
     symbols.value = []
     tickers.value = []
     universeError.value = ''
-    // IBKR 仅支持逐笔 tick 行情，强制切到 Tick 视图
-    if (next === 'ibkr') view.value = 'tick'
-    else if (next !== 'tradovate' && view.value !== 'candlestick') view.value = 'candlestick'
+    // IBKR 同时支持历史/实时 K 线与逐笔 tick，保留当前视图（不再强制切到 Tick）
+    if (next !== 'tradovate' && view.value !== 'candlestick') view.value = 'candlestick'
     void loadUniverse()
   }
 
@@ -125,11 +124,17 @@ export const useMarketStore = defineStore('market', () => {
     if (ticker.value) ticker.value = { ...ticker.value, price: kline.close, updatedAt: Date.now() }
   }
 
-  /** 全量历史批量（Tradovate hist）：整表替换。 */
-  function applyHist(rows: Kline[]) {
+  /**
+   * 全量历史批量（append=false 整表替换；append=true 追加更早分页数据）。
+   * 无论哪种模式都按 time 去重 + 升序，保证 setData 的有序性。
+   */
+  function applyHist(rows: Kline[], append = false) {
     if (!Array.isArray(rows)) return
-    // 按 time 去重 + 升序，保证 setData 有序性
     const seen = new Map<number, Kline>()
+    const source = append ? klines.value : []
+    for (const k of source) {
+      if (k && typeof k.time === 'number' && Number.isFinite(k.time)) seen.set(k.time, k)
+    }
     for (const k of rows) {
       if (k && typeof k.time === 'number' && Number.isFinite(k.time)) seen.set(k.time, k)
     }

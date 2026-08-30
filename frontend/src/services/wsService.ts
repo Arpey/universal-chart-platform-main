@@ -124,16 +124,24 @@ export interface IBKRSymbolInfo {
 export interface IBKRConnectOptions {
   /** 当前订阅的 IBKR 合约（如 MES），连接建立/重连后自动发送 subscribe 消息。 */
   symbol: string
+  /** K 线周期（随 subscribe 消息下发，决定后端 reqHistoricalData / reqRealTimeBars 粒度）。 */
+  interval: Interval
   /** get_symbols 返回的 CME 期货标的列表。 */
   onSymbols?: (symbols: IBKRSymbolInfo[]) => void
   /** IBKR tick 行情（标准化为 TradeTick，side 为空）。 */
   onTick?: (tick: TradeTick) => void
+  /** IBKR 实时 K 线（后端 reqRealTimeBars 推送 { symbol, time, open, high, low, close, volume }）。 */
+  onKline?: (kline: Kline) => void
+  /** IBKR 历史 K 线（后端 reqHistoricalData 一次性推送；分页时 append=true 表示更早数据，应合并而非替换）。 */
+  onHist?: (klines: Kline[], append?: boolean) => void
   onState?: (connected: boolean) => void
   onError?: (message: string) => void
 }
 
 export interface IBKRConnection {
   disconnect: () => void
+  /** 分页加载更早历史：endDateTime = 已加载 K 线最左侧的 Unix 时间戳（epoch ms）。 */
+  loadMoreHistory: (endDateTime: number) => void
 }
 
 /**
@@ -153,7 +161,9 @@ export function connectIBKR(opts: IBKRConnectOptions): IBKRConnection {
     if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(payload))
   }
   const requestSymbols = () => send({ action: 'get_symbols', source: 'IBKR' })
-  const subscribe = () => send({ action: 'subscribe', source: 'IBKR', symbol: opts.symbol })
+  const subscribe = () => send({ action: 'subscribe', source: 'IBKR', symbol: opts.symbol, interval: opts.interval })
+  /** 分页拉取更早历史 K 线（向后端透传最左侧时间戳）。 */
+  const loadMoreHistory = (endDateTime: number) => send({ action: 'load_more_history', source: 'IBKR', symbol: opts.symbol, interval: opts.interval, endDateTime })
 
   const connect = () => {
     if (stopped) return
@@ -173,6 +183,7 @@ export function connectIBKR(opts: IBKRConnectOptions): IBKRConnection {
         price?: number
         size?: number
         timestamp?: number
+        append?: boolean
       }
       try {
         msg = JSON.parse(event.data as string) as typeof msg
@@ -193,6 +204,12 @@ export function connectIBKR(opts: IBKRConnectOptions): IBKRConnection {
               timestamp: typeof msg.timestamp === 'number' ? msg.timestamp : Date.now(),
             })
           }
+          break
+        case 'kline':
+          if (msg.data) opts.onKline?.(msg.data as Kline)
+          break
+        case 'hist':
+          if (Array.isArray(msg.data)) opts.onHist?.(msg.data as Kline[], Boolean(msg.append))
           break
         case 'connected':
           opts.onState?.(true)
@@ -227,6 +244,7 @@ export function connectIBKR(opts: IBKRConnectOptions): IBKRConnection {
       socket?.close()
       socket = null
     },
+    loadMoreHistory,
   }
 }
 

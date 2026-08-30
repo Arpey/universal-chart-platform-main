@@ -60,7 +60,7 @@ export function attachMarketSocket(server: Server, manager = new MarketManager()
 
     // 消息驱动订阅：处理前端 JSON 消息，例如 {"action": "subscribe", "source": "IBKR", "symbol": "MES"}
     client.on('message', (raw) => {
-      let msg: { action?: unknown; source?: unknown; symbol?: unknown } | null = null
+      let msg: { action?: unknown; source?: unknown; symbol?: unknown; interval?: unknown; endDateTime?: unknown } | null = null
       try { msg = JSON.parse(raw.toString()) } catch { return } // 忽略非 JSON 消息
       if (!msg) return
       const action = String(msg.action ?? '').toLowerCase()
@@ -78,10 +78,15 @@ export function attachMarketSocket(server: Server, manager = new MarketManager()
         send({ type: 'error', message: '非法的 IBKR 合约代码' })
         return
       }
+      const interval = (String(msg.interval ?? '1m') as Interval)
+      if (!(INTERVALS as readonly string[]).includes(interval)) {
+        send({ type: 'error', message: '非法的 K 线周期' })
+        return
+      }
 
       if (action === 'subscribe') {
         const adapter = ibkrAdapter
-        if (!adapter?.subscribeTick) {
+        if (!adapter?.subscribeTick || !adapter.subscribeBar) {
           send({ type: 'error', message: 'IBKR 数据源未启用（请检查 IBKR_ENABLED 配置）' })
           return
         }
@@ -89,16 +94,52 @@ export function attachMarketSocket(server: Server, manager = new MarketManager()
         // 连接预检：等待本地 IB Gateway / TWS 就绪，失败时向前端返回明确错误
         const preflight = adapter.ping?.() ?? Promise.resolve()
         preflight
-          .then(() => {
+          .then(async () => {
             if (client.readyState !== client.OPEN) return
             if (ibkrSubscriptions.has(symbol)) return
-            const unsub = adapter.subscribeTick!(
-              symbol,
-              (tick) => send(tick), // TickerMessage 直接广播：{ type: 'ticker', source: 'IBKR', ... }
-              (message) => send({ type: 'error', message }),
-            )
-            ibkrSubscriptions.set(symbol, unsub)
-            send({ type: 'connected', source: 'IBKR', symbol, dataType: 'tick' })
+            const unsubs: Array<() => void> = []
+            // 0) 底层连接状态：断线/重连时广播给客户端（前端据此提示）
+            const unsubStatus = adapter.onStatus?.((connected, error) => {
+              if (client.readyState !== client.OPEN) return
+              if (connected) send({ type: 'connected', source: 'IBKR', symbol, interval, dataType: 'tick' })
+              else send({ type: 'error', message: error?.message ? `[IBKR] 连接断开: ${error.message}` : '[IBKR] 连接断开，自动重连中...' })
+            })
+            if (unsubStatus) unsubs.push(unsubStatus)
+            // 1) 逐笔 tick 流（reqContractDetails 解析合约 → reqMktData + reqTickByTickData）
+            try {
+              const unsubTick = await adapter.subscribeTick!(
+                symbol,
+                (tick) => send(tick), // TickerMessage 直接广播：{ type: 'ticker', source: 'IBKR', ... }
+                (message) => send({ type: 'error', message }),
+              )
+              unsubs.push(unsubTick)
+            } catch (err) {
+              send({ type: 'error', message: err instanceof Error ? err.message : 'IBKR tick 订阅失败' })
+              for (const unsub of unsubs) unsub()
+              return
+            }
+            // 2) 实时 K 线流（reqRealTimeBars → { symbol, time, open, high, low, close, volume }）
+            try {
+              const unsubBar = await adapter.subscribeBar!(
+                symbol,
+                interval,
+                (kline) => send({ type: 'kline', source: 'IBKR', symbol, interval, data: kline }),
+                (message) => send({ type: 'error', message }),
+              )
+              unsubs.push(unsubBar)
+            } catch (err) {
+              send({ type: 'error', message: err instanceof Error ? err.message : 'IBKR 实时K线订阅失败' })
+              for (const unsub of unsubs) unsub()
+              return
+            }
+            // 3) 历史 K 线快照（reqHistoricalData 一次性全量，内置超时；失败仅报错不影响实时流）
+            void adapter.getKlines(symbol, interval, 300)
+              .then((rows) => {
+                if (client.readyState === client.OPEN) send({ type: 'hist', source: 'IBKR', symbol, interval, append: false, data: rows })
+              })
+              .catch((err) => send({ type: 'error', message: err instanceof Error ? err.message : 'IBKR 历史K线加载失败' }))
+            ibkrSubscriptions.set(symbol, () => { for (const unsub of unsubs) unsub() })
+            send({ type: 'connected', source: 'IBKR', symbol, interval, dataType: 'tick' })
           })
           .catch((err) => {
             send({ type: 'error', message: err instanceof Error ? err.message : 'IBKR 数据源连接失败' })
@@ -110,6 +151,25 @@ export function attachMarketSocket(server: Server, manager = new MarketManager()
           ibkrSubscriptions.delete(symbol)
           send({ type: 'unsubscribed', source: 'IBKR', symbol })
         }
+      } else if (action === 'load_more_history') {
+        // 分页拉取更早历史：endDateTime = 当前已加载 K 线最左侧的 Unix 时间戳（epoch ms），
+        // 后端透传给 reqHistoricalData 的 endDateTime，返回更早一段数据并以 append 标记推送。
+        const adapter = ibkrAdapter
+        if (!adapter?.getKlines) {
+          send({ type: 'error', message: 'IBKR 数据源未启用（请检查 IBKR_ENABLED 配置）' })
+          return
+        }
+        const endDateTime = Number(msg.endDateTime)
+        if (!Number.isFinite(endDateTime) || endDateTime <= 0) {
+          send({ type: 'error', message: '非法的 endDateTime（应为已加载 K 线最左侧的 Unix 时间戳）' })
+          return
+        }
+        logger.info(`[IBKR] load_more_history: ${symbol} ${interval} endDateTime=${endDateTime}`)
+        void adapter.getKlines(symbol, interval, 300, endDateTime)
+          .then((rows) => {
+            if (client.readyState === client.OPEN) send({ type: 'hist', source: 'IBKR', symbol, interval, append: true, data: rows })
+          })
+          .catch((err) => send({ type: 'error', message: err instanceof Error ? err.message : 'IBKR 历史K线加载失败' }))
       }
     })
 
@@ -202,7 +262,10 @@ function createSubscription(
       return adapter.subscribeDOM(symbol, (data) => send({ type: 'dom', data }), onError)
     case 'tick':
       if (!adapter.subscribeTick) throw new Error('当前数据源不支持逐笔流')
-      return adapter.subscribeTick(symbol, (data) => send({ type: 'tick', data }), onError)
+      // IBKR 的 subscribeTick 为异步（需先解析合约），仅经控制通道订阅，不会走到这里；
+      // 其它数据源为同步，直接返回取消函数。
+      const tickUnsub = adapter.subscribeTick(symbol, (data) => send({ type: 'tick', data }), onError)
+      return typeof tickUnsub === 'function' ? tickUnsub : () => { void tickUnsub.then((unsub) => unsub()) }
     default:
       throw new Error('非法 dataType')
   }
