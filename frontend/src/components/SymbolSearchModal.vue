@@ -10,7 +10,7 @@ type SourceTabId = 'all' | 'binance' | 'tradovate' | 'ibkr' | 'stocks' | 'forex'
 const TABS: { id: SourceTabId; label: string; hint?: string }[] = [
   { id: 'all', label: 'All' },
   { id: 'binance', label: 'Binance' },
-  { id: 'tradovate', label: 'Tradovate' },
+  // { id: 'tradovate', label: 'Tradovate' },
   { id: 'ibkr', label: 'IBKR' },
   { id: 'stocks', label: 'Stocks', hint: '暂无股票数据源接入' },
   { id: 'forex', label: 'Forex', hint: '暂无外汇数据源接入' },

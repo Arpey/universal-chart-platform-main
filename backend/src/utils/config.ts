@@ -64,6 +64,13 @@ export const config = {
     clientId: resolveIBKRClientId(),
     // IBKR_DEBUG=true 时输出协议级 sent/received/result 日志，便于握手排障
     debug: process.env.IBKR_DEBUG === 'true'
+  },
+  // 本地 Playwright 下单服务（Tradovate 交易驱动经其下单 / 撤单 / 查询持仓与账户）
+  // - 默认地址 http://localhost:8000，可用 TRADING_SERVICE_URL 覆盖；
+  // - TRADING_SERVICE_TIMEOUT 控制单次 HTTP 请求超时（毫秒）。
+  tradingService: {
+    baseUrl: process.env.TRADING_SERVICE_URL ?? 'http://localhost:8000',
+    timeoutMs: Number(process.env.TRADING_SERVICE_TIMEOUT ?? 15000)
   }
 }
 

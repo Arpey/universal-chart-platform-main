@@ -8,6 +8,7 @@ import TradeTape from './components/TradeTape.vue'
 import StatusBar from './components/StatusBar.vue'
 import IndicatorsModal from './components/IndicatorsModal.vue'
 import DataSourceSwitcher from './components/DataSourceSwitcher.vue'
+import TradingPanel from './components/trading/TradingPanel.vue'
 import { useMarketStore } from './stores/marketStore'
 import { connectMarket, connectIBKR, type WsDataType, type IBKRConnection } from './services/wsService'
 import { useCountdown } from './composables/useCountdown'
@@ -277,6 +278,8 @@ function formatPrice(value?: number) {
           :symbol="market.symbol"
         />
       </div>
+      <!-- 交易面板：下单 + 持仓 + 挂单 -->
+      <TradingPanel />
       <Watchlist />
     </section>
 
