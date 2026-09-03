@@ -22,6 +22,8 @@ export const useTradingStore = defineStore('trading', () => {
   const activeSymbol = ref('')
   /** 最近一次操作错误信息（供 UI 提示） */
   const error = ref('')
+  /** 下单面板开关（默认折叠/隐藏；统一由顶栏按钮 / 快捷键 / 图表右键菜单读写，保证各入口状态同步） */
+  const isOrderPanelOpen = ref(false)
 
   /** 当前 Broker 适配器实例（非响应式内部状态） */
   let adapter: IBrokerAdapter | null = null
@@ -176,6 +178,23 @@ export const useTradingStore = defineStore('trading', () => {
     activeSymbol.value = symbol
   }
 
+  // ---------- 下单面板 UI 状态（集中管理，供任意入口调用） ----------
+
+  /** 打开下单面板。 */
+  function openOrderPanel(): void {
+    isOrderPanelOpen.value = true
+  }
+
+  /** 关闭下单面板。 */
+  function closeOrderPanel(): void {
+    isOrderPanelOpen.value = false
+  }
+
+  /** 切换下单面板开关（顶栏按钮 / 快捷键可调用）。 */
+  function toggleOrderPanel(): void {
+    isOrderPanelOpen.value = !isOrderPanelOpen.value
+  }
+
   return {
     // state
     currentBrokerType,
@@ -185,6 +204,7 @@ export const useTradingStore = defineStore('trading', () => {
     accountSummary,
     activeSymbol,
     error,
+    isOrderPanelOpen,
     // getters
     totalUnrealizedPnL,
     currentSymbolPosition,
@@ -196,5 +216,8 @@ export const useTradingStore = defineStore('trading', () => {
     cancelOrder,
     refreshData,
     setActiveSymbol,
+    openOrderPanel,
+    closeOrderPanel,
+    toggleOrderPanel,
   }
 })

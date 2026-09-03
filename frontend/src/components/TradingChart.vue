@@ -36,6 +36,10 @@ interface Kline {
 const props = defineProps<{
   data: Kline[]
   interval: Interval
+  /** 当前标的（如 BTCUSDT / NQ / MES）：用于识别跨标的切换并触发完整图表重置 */
+  symbol?: string
+  /** 当前数据源（binance / tradovate / ibkr / tradefi） */
+  datasource?: string
   activeTool?: DrawKind
   magnet?: boolean
   stayInMode?: boolean
@@ -87,6 +91,11 @@ let disposed = false
 let ro: ResizeObserver | null = null
 let loadMoreGuardTime = 0 // 已触发 load_more 的最旧 bar 时间（避免同一边界重复请求）
 let loadMoreGuardAt = 0 // 上次触发时间戳（节流，防止连续滚动时打爆后端）
+/** 当前已渲染的标的/数据源上下文（用于识别跨标的切换）。 */
+let prevScopeSymbol = props.symbol ?? ''
+let prevScopeDatasource = props.datasource ?? ''
+/** 新标的/周期数据尚未就绪：等下一次全量 setData 后调用 fitContent 自适应坐标。 */
+let pendingAutoFit = true
 
 // ---------- K 线收盘倒计时 ----------
 const lastTimeSec = computed(() => props.data[props.data.length - 1]?.time)
@@ -227,11 +236,54 @@ function applyData(data: Kline[], force: boolean) {
     volumeSeries.setData(bars.map(toVolume))
     lastLen = bars.length
     lastFirstTime = firstTime
+    // 切换标的/周期/首次加载后：新数据就绪即自适应时间轴与价格轴
+    if (pendingAutoFit && bars.length > 0) {
+      pendingAutoFit = false
+      autoFitChart()
+    }
   } else if (bars.length > 0) {
     const last = bars[bars.length - 1]
     candleSeries.update(toCandle(last))
     volumeSeries.update(toVolume(last))
   }
+}
+
+/**
+ * 标的/数据源/周期切换时的完整重置：
+ * 清空 Series、重置坐标状态与分页守卫，等待新数据到达后由 autoFitChart() 自适应。
+ */
+function resetChartContext(clearDrawings: boolean) {
+  if (disposed || !chart || !candleSeries || !volumeSeries) return
+  // 1) 清空 K 线 / 成交量序列：防止“长度+首根时间未变”的增量分支误判为同序列 tick
+  candleSeries.setData([])
+  volumeSeries.setData([])
+  lastLen = 0
+  lastFirstTime = 0
+  // 2) 分页守卫归零，避免新标的沿用旧标的的 load_more 去重边界
+  loadMoreGuardTime = 0
+  loadMoreGuardAt = 0
+  // 3) EMA：旧标的数值失效，先清空渲染，待新数据经 syncEmaSeries 重算
+  for (const s of emaSeriesMap.values()) s.setData([])
+  emaLastValues.value = {}
+  // 4) 价格轴恢复自动缩放（用户对旧标的手动拖动/缩放不带到新标的）
+  chart.priceScale('right').applyOptions({ autoScale: true })
+  chart.priceScale('volume').applyOptions({ autoScale: true })
+  // 5) 绘制状态：取消进行中的放置/拖拽；标的或数据源变化时旧画线坐标已无意义 → 一并清空
+  cancelPending()
+  deselect()
+  if (clearDrawings) drawings.value = []
+  primitive?.setKlines([])
+  primitive?.setObjects(drawings.value, selectedId.value)
+  // 6) 标记等待新数据 → applyData 全量写入后自动 fitContent
+  pendingAutoFit = true
+}
+
+/** 新数据就绪后：时间轴 fit 到完整新区间，价格轴按新标的区间恢复自动缩放。 */
+function autoFitChart() {
+  if (!chart) return
+  chart.timeScale().fitContent()
+  chart.priceScale('right').applyOptions({ autoScale: true })
+  chart.priceScale('volume').applyOptions({ autoScale: true })
 }
 
 /** 归一化原始 K 线：过滤非法行 → 同 time 去重 → 按 time 升序（满足 setData 的严格有序要求） */
@@ -363,6 +415,19 @@ watch(
     })
   },
   { deep: true },
+)
+
+// 标的 / 数据源 / 周期变化 → 完整重置图表（Series、坐标轴、分页守卫、指标与画线状态）
+watch(
+  [() => props.symbol, () => props.datasource, () => props.interval],
+  () => {
+    if (disposed) return
+    const scopeChanged =
+      (props.symbol ?? '') !== prevScopeSymbol || (props.datasource ?? '') !== prevScopeDatasource
+    prevScopeSymbol = props.symbol ?? ''
+    prevScopeDatasource = props.datasource ?? ''
+    resetChartContext(scopeChanged)
+  },
 )
 
 watch(

@@ -10,14 +10,16 @@ import IndicatorsModal from './components/IndicatorsModal.vue'
 import DataSourceSwitcher from './components/DataSourceSwitcher.vue'
 import TradingPanel from './components/trading/TradingPanel.vue'
 import { useMarketStore } from './stores/marketStore'
+import { useTradingStore } from './stores/tradingStore'
 import { connectMarket, connectIBKR, type WsDataType, type IBKRConnection } from './services/wsService'
 import { useCountdown } from './composables/useCountdown'
 import type { MarketView } from './types'
 import type { DrawKind } from './types/drawing'
 
 const market = useMarketStore()
+const trading = useTradingStore()
 const lastTimeSec = computed(() => market.klines[market.klines.length - 1]?.time)
-const { countdown: candleCountdown } = useCountdown(computed(() => market.interval), lastTimeSec)
+const { countdown: candleCountdown, targetClock: nextCandleOpenClock } = useCountdown(computed(() => market.interval), lastTimeSec)
 const connected = ref(false)
 const searchOpen = ref(false)
 const indicatorModalOpen = ref(false)
@@ -163,8 +165,15 @@ function refresh() {
   }).disconnect
 }
 
-// 标的 / 周期 / 数据源 / 视图任一变化都重建订阅
-watch(() => [market.symbol, market.interval, market.datasource, market.view], refresh)
+// 标的 / 周期 / 数据源 / 视图任一变化都重建订阅；
+// 其中 标的/周期/数据源 变化时先清空旧标的快照，避免图表、价格与倒计时沿用旧坐标
+watch(
+  () => [market.symbol, market.interval, market.datasource, market.view],
+  ([sym, iv, src], [oSym, oIv, oSrc]) => {
+    if (sym !== oSym || iv !== oIv || src !== oSrc) market.clearMarketData()
+    refresh()
+  },
+)
 onMounted(async () => {
   await market.loadUniverse()
   refresh()
@@ -210,7 +219,7 @@ function formatPrice(value?: number) {
             @click="pickView(v.id)"
           >{{ v.label }}</button>
         </div>
-        <span class="candle-countdown" title="距下一根 K 线开盘">⏱ {{ candleCountdown }}</span>
+        <span class="candle-countdown" :title="'距下一根 K 线开盘 · 北京时间 ' + nextCandleOpenClock">⏱ {{ candleCountdown }}</span>
         <span v-if="market.ticker" class="last-price" :class="market.ticker.change24h >= 0 ? 'up' : 'down'">
           {{ formatPrice(market.ticker.price) }}
         </span>
@@ -220,6 +229,15 @@ function formatPrice(value?: number) {
       </div>
       <div class="topbar-right">
         <span class="badge">{{ currentSourceLabel }} · {{ isTradovate ? 'FUTURES' : 'PERPETUAL · USDT' }} <b>●</b></span>
+        <button
+          class="order-btn"
+          :class="{ active: trading.isOrderPanelOpen }"
+          title="快捷下单（点击展开侧边下单面板，Esc 关闭）"
+          @click="trading.toggleOrderPanel()"
+        >
+          <span class="order-btn-icon">⚡</span>
+          <span>下单</span>
+        </button>
         <button class="search-btn" title="搜索交易对" @click="searchOpen = true">⌕</button>
       </div>
     </header>
@@ -258,6 +276,8 @@ function formatPrice(value?: number) {
           v-if="market.view === 'candlestick'"
           :data="market.klines"
           :interval="market.interval"
+          :symbol="market.symbol"
+          :datasource="market.datasource"
           :active-tool="activeTool"
           :magnet="magnet"
           :stay-in-mode="stayInMode"
@@ -278,10 +298,11 @@ function formatPrice(value?: number) {
           :symbol="market.symbol"
         />
       </div>
-      <!-- 交易面板：下单 + 持仓 + 挂单 -->
-      <TradingPanel />
       <Watchlist />
     </section>
+
+    <!-- 下单面板：默认折叠，点击顶栏“下单”按钮以右侧抽屉展开 -->
+    <TradingPanel />
 
     <StatusBar :connected="connected" :count="market.klines.length" :datasource="currentSourceLabel" :view="market.view" />
     <SymbolSearchModal v-model:open="searchOpen" />
@@ -421,6 +442,26 @@ function formatPrice(value?: number) {
 .topbar-right { display: flex; align-items: center; gap: 10px; }
 .badge { font-size: 11px; font-weight: 700; letter-spacing: 0.5px; color: var(--color-text-muted); text-transform: uppercase; }
 .badge b { color: #10b981; }
+/* “下单”按钮：点击展开/收起侧边下单面板 */
+.order-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 12px;
+  background: var(--color-bg-tertiary);
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+.order-btn:hover { border-color: #3b82f6; color: #3b82f6; }
+.order-btn.active { background: rgba(59, 130, 246, 0.14); border-color: #3b82f6; color: #3b82f6; }
+.order-btn-icon { font-size: 13px; line-height: 1; }
 .search-btn {
   width: 32px; height: 32px; display: inline-flex; align-items: center; justify-content: center;
   background: var(--color-bg-tertiary); color: var(--color-text);

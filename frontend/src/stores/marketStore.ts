@@ -115,6 +115,18 @@ export const useMarketStore = defineStore('market', () => {
   /** 切换交易对（由搜索列表触发）。 */
   function setSymbol(next: string) { symbol.value = next }
 
+  /**
+   * 切换标的/周期/数据源前清空旧标的全部行情快照（K 线、价格、盘口、逐笔），
+   * 避免新数据到达前图表 / 顶栏价格 / 倒计时锚点继续沿用旧标的坐标与数值。
+   */
+  function clearMarketData() {
+    klines.value = []
+    ticker.value = undefined
+    quote.value = undefined
+    dom.value = undefined
+    trades.value = []
+  }
+
   function update(kline: Kline) {
     if (!kline || typeof kline.time !== 'number') return
     const last = klines.value.at(-1)
@@ -183,5 +195,6 @@ export const useMarketStore = defineStore('market', () => {
     load, loadUniverse, setDatasource, switchSource, setView, setSymbol,
     update, applyHist, setQuote, setDom, addTrade, setPrice,
     applySymbols,
+    clearMarketData,
   }
 })
