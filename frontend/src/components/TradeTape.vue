@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
 import type { TradeTick } from '../types'
+import { beijingDateOf } from '../utils/beijingTime'
 
 const props = defineProps<{ trades: TradeTick[]; symbol: string }>()
 
@@ -17,8 +18,11 @@ watch(rows, async () => {
 
 const fmtPrice = (v: number) => v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 const fmtTime = (t: number) => {
-  const d = new Date(t)
-  return d.toLocaleTimeString('en-US', { hour12: false }) + '.' + String(d.getMilliseconds()).padStart(3, '0')
+  // 北京时间（UTC+8）：兼容秒 / 毫秒两种时间戳单位（Tradovate 毫秒 / IBKR 毫秒 / 历史快照秒）
+  const d = beijingDateOf(t)
+  if (!d) return '--:--:--.---'
+  const p = (v: number) => String(v).padStart(2, '0')
+  return `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}.${String(d.getUTCMilliseconds()).padStart(3, '0')}`
 }
 const sideClass = (s: TradeTick['side']) => (s === 'Buy' ? 'buy' : s === 'Sell' ? 'sell' : '')
 </script>

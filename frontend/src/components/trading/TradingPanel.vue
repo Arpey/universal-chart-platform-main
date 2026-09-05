@@ -14,6 +14,27 @@ const trading = useTradingStore()
 const open = computed(() => trading.isOrderPanelOpen)
 const symbol = computed(() => trading.activeSymbol || market.symbol)
 
+/** 行情实时价联动到支持估值的适配器（MOCK 模拟盘），保证持仓 PnL/账户权益随行情刷新。 */
+watch(
+  () => market.ticker?.price,
+  (price) => {
+    if (price == null || price <= 0) return
+    const sym = trading.activeSymbol || market.symbol
+    if (sym) trading.feedMarkPrice(sym, price)
+  },
+)
+
+/** Broker 连接完成后立即用最新价同步一次（让 MOCK 成交均价贴近真实行情）。 */
+watch(
+  () => trading.isConnected,
+  (connected) => {
+    if (!connected) return
+    const price = market.ticker?.price
+    const sym = trading.activeSymbol || market.symbol
+    if (price != null && price > 0 && sym) trading.feedMarkPrice(sym, price)
+  },
+)
+
 function close() {
   trading.closeOrderPanel()
 }

@@ -7,22 +7,58 @@ import {
   CandlestickSeries,
   HistogramSeries,
   LineSeries,
+  TickMarkType,
   type IChartApi,
   type ISeriesApi,
   type LineData,
   type LineWidth,
   type LogicalRange,
+  type Time,
   type UTCTimestamp,
 } from 'lightweight-charts'
 import { CandleCountdownPrimitive } from './CandleCountdownPrimitive'
 import { DrawingPrimitive } from './DrawingPrimitive'
+import { PositionLinePrimitive, type PositionLineState } from './PositionLinePrimitive'
 import DrawingToolbar from './DrawingToolbar.vue'
 import EMASettingsModal from './EMASettingsModal.vue'
 import { useCountdown } from '../composables/useCountdown'
 import { useIndicatorStore } from '../stores/indicatorStore'
+import { useTradingStore } from '../stores/tradingStore'
 import { calculateEMA } from '../utils/indicators'
+import { formatBeijingDateTime, formatBeijingShort, timeLikeToEpochSec } from '../utils/beijingTime'
 import { POINT_COUNT, randomColor, DEFAULT_FIB_LEVELS, type DrawKind, type DrawObject, type DrawPoint } from '../types/drawing'
 import type { Interval } from '../types'
+import type { OrderPreset } from '../types/trading'
+
+// ---------- 北京时间（UTC+8）刻度/十字光标格式化 ----------
+// lightweight-charts 默认按 UTC 墙钟渲染时间轴；这里在展示层显式 +8h，
+// 平移后读取 UTC getter，得到与浏览器本地时区无关的北京时间。
+function formatBeijingTickMark(time: Time, tickMarkType: TickMarkType, _locale: string): string {
+  const sec = timeLikeToEpochSec(time)
+  if (sec == null) return ''
+  const shifted = sec + 28800 // +8h 后按 UTC 墙钟读取即北京时间
+  const d = new Date(shifted * 1000)
+  const p = (v: number) => String(v).padStart(2, '0')
+  switch (tickMarkType) {
+    case TickMarkType.Year:
+      return String(d.getUTCFullYear())
+    case TickMarkType.Month:
+      return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}`
+    case TickMarkType.DayOfMonth:
+      return `${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}`
+    case TickMarkType.TimeWithSeconds:
+      return `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`
+    case TickMarkType.Time:
+    default:
+      return `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`
+  }
+}
+
+function formatBeijingCrosshairTime(time: Time): string {
+  const sec = timeLikeToEpochSec(time)
+  if (sec == null) return '--'
+  return formatBeijingShort(sec)
+}
 
 interface Kline {
   time: number
@@ -51,6 +87,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   toolState: [active: boolean]
   drawingDone: []
+  openOrder: [preset: OrderPreset]
 }>()
 
 const container = ref<HTMLElement>()
@@ -59,9 +96,10 @@ let candleSeries: ISeriesApi<'Candlestick'> | null = null
 let volumeSeries: ISeriesApi<'Histogram'> | null = null
 let primitive: DrawingPrimitive | null = null
 let countdownPrimitive: CandleCountdownPrimitive | null = null
+let positionPrimitive: PositionLinePrimitive | null = null
 
 // ---------- 画线交互状态（FSM: idle → placing → selected/dragging） ----------
-const mode = ref<'idle' | 'placing' | 'dragging'>('idle')
+const mode = ref<'idle' | 'placing' | 'dragging' | 'bracket-drag'>('idle')
 const selectedId = ref<string | null>(null)
 const toolbarPos = ref<{ left: number; top: number } | null>(null)
 const hoverState = ref<'anchor' | 'body' | null>(null)
@@ -72,6 +110,9 @@ let dragId: string | null = null
 let dragIndex: number | null = null
 let dragOrigin: DrawPoint | null = null
 let dragStartPoints: DrawPoint[] = []
+/** 持仓线 TP/SL 拖拽位移追踪（≥4px 才允许 mouseup 提交保护单）。 */
+let bracketDragStartY = 0
+let bracketDragMoved = false
 let clickHandler: ((param: any) => void) | null = null
 let crosshairHandler: ((param: any) => void) | null = null
 
@@ -108,10 +149,134 @@ watch([countdown, lastClose], () => {
   }
 })
 
+// ---------- 图表持仓线（TradingView 风格：方向 / 均价 / 数量 / 实时盈亏 / TP·SL） ----------
+const trading = useTradingStore()
+/** 当前图表品种的现仓（无则 null）。 */
+const activePosition = computed(() => {
+  const sym = (props.symbol ?? '').toUpperCase()
+  if (!sym) return null
+  const p = trading.positions.find((x) => x.symbol === sym && x.qty > 0)
+  return p ?? null
+})
+/** TP/SL 拖拽草稿价（拖拽中实时预览，mouseup 才提交挂单）。 */
+const draftSl = ref<number | null>(null)
+const draftTp = ref<number | null>(null)
+/** 正在拖拽的 bracket 手柄（高亮）。 */
+const bracketTarget = ref<'tp' | 'sl' | null>(null)
+/** 图表右键菜单（含价格与北京时间的显示）。 */
+const ctxMenu = ref<{ x: number; y: number; price: number; time: number } | null>(null)
+/** 现仓减仓方向（设置止盈/止损时优先按减仓腿方向预填；无现仓时留给用户选择）。 */
+const ctxReduceSide = computed<'BUY' | 'SELL' | undefined>(() => {
+  const pos = activePosition.value
+  if (!pos) return undefined
+  return pos.side === 'BUY' ? 'SELL' : 'BUY'
+})
+
+/** 持仓线默认止盈/止损建议间距（占持仓均价的百分比）。 */
+const BRACKET_SUGGEST_PCT = 0.01
+
+function roundToTick(value: number, refPrice: number): number {
+  const str = String(refPrice)
+  const dot = str.indexOf('.')
+  const dec = dot >= 0 ? Math.min(6, str.length - dot - 1) : 2
+  const m = Math.pow(10, dec)
+  return Math.round(value * m) / m
+}
+
+/** 计算并推送 PositionLinePrimitive 需要的最新叠加状态。 */
+function syncPositionOverlay() {
+  if (!positionPrimitive) return
+  const pos = activePosition.value
+  if (!pos) {
+    positionPrimitive.setState(null)
+    return
+  }
+  const dir = pos.side === 'BUY' ? 1 : -1
+  const last = lastClose.value > 0 ? lastClose.value : pos.markPrice
+  const mark = Number.isFinite(last) && last > 0 ? last : pos.markPrice
+  const pnl = (mark - pos.entryPrice) * pos.qty * dir
+  const cost = pos.entryPrice * pos.qty
+  const pnlPct = cost > 0 ? (pnl / cost) * 100 : 0
+  const bracket = trading.getPositionBracket(pos.symbol)
+  const suggDist = pos.entryPrice * BRACKET_SUGGEST_PCT
+  const suggestedStopLoss = bracket.stopLoss == null ? pos.entryPrice - dir * suggDist : null
+  const suggestedTakeProfit = bracket.takeProfit == null ? pos.entryPrice + dir * suggDist : null
+  const state: PositionLineState = {
+    symbol: pos.symbol,
+    side: pos.side,
+    qty: pos.qty,
+    entry: pos.entryPrice,
+    mark,
+    pnl,
+    pnlPct,
+    takeProfit: bracket.takeProfit,
+    stopLoss: bracket.stopLoss,
+    suggestedTakeProfit,
+    suggestedStopLoss,
+    draftTakeProfit: draftTp.value,
+    draftStopLoss: draftSl.value,
+    dragging: bracketTarget.value,
+  }
+  positionPrimitive.setState(state)
+}
+
+// 行情价格 / 持仓 / bracket / 拖拽草稿任一变化 → 实时刷新持仓线叠加层
+watch(
+  () => [
+    props.symbol,
+    props.data,
+    trading.positions,
+    () => trading.positionBrackets[(props.symbol ?? '').toUpperCase()],
+    draftSl,
+    draftTp,
+    bracketTarget,
+  ],
+  () => syncPositionOverlay(),
+  { deep: true },
+)
+
+/** 提交拖拽中的 TP/SL（落腿 → 撤旧单 + 挂新保护单）。 */
+async function commitBracketDrag() {
+  const pos = activePosition.value
+  if (!pos) return
+  const symbol = pos.symbol
+  const cur = trading.getPositionBracket(symbol)
+  const nextSl = draftSl.value ?? cur.stopLoss
+  const nextTp = draftTp.value ?? cur.takeProfit
+  const slChanged = nextSl !== cur.stopLoss
+  const tpChanged = nextTp !== cur.takeProfit
+  if (slChanged || tpChanged) {
+    try {
+      await trading.setPositionBracket(symbol, {
+        stopLoss: slChanged ? nextSl : undefined,
+        takeProfit: tpChanged ? nextTp : undefined,
+      })
+    } catch (err) {
+      trading.error = err instanceof Error ? err.message : String(err)
+    }
+  }
+  draftSl.value = null
+  draftTp.value = null
+  bracketTarget.value = null
+  syncPositionOverlay()
+}
+
+/** 图表右键菜单操作：带价格/方向的快捷下单预设 → 通知 App 打开下单面板。 */
+function openQuickOrder(preset: OrderPreset) {
+  ctxMenu.value = null
+  emit('openOrder', preset)
+}
+
+function closeCtxMenu() {
+  ctxMenu.value = null
+}
+
+
 // 选中对象 / 磁吸开关 / 容器光标反馈
 const selectedObj = computed(() => drawings.value.find((d) => d.id === selectedId.value) ?? null)
 const magnetActive = computed(() => !!props.magnet || magnetHeld.value)
 const containerCursor = computed(() => {
+  if (mode.value === 'bracket-drag') return 'ns-resize'
   if (mode.value === 'dragging') return 'grabbing'
   if (hoverState.value) return 'grab'
   if (currentTool() !== 'cursor') return 'crosshair'
@@ -128,6 +293,9 @@ onMounted(async () => {
       textColor: '#8090a5',
       fontFamily: 'Manrope, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
       fontSize: 11,
+    },
+    localization: {
+      timeFormatter: (time: Time) => formatBeijingCrosshairTime(time),
     },
     grid: {
       vertLines: { color: 'rgba(32,42,56,0.6)' },
@@ -148,6 +316,9 @@ onMounted(async () => {
       secondsVisible: false,
       rightOffset: 5,
       barSpacing: 8,
+      // X 轴刻度强制按北京时间（UTC+8）渲染，不再跟随浏览器时区/UTC 默认
+      tickMarkFormatter: (time: Time, tickMarkType: TickMarkType, locale: string) =>
+        formatBeijingTickMark(time, tickMarkType, locale),
     },
     handleScale: { axisPressedMouseMove: true },
   })
@@ -175,6 +346,11 @@ onMounted(async () => {
   countdownPrimitive = new CandleCountdownPrimitive()
   candleSeries.attachPrimitive(countdownPrimitive)
   countdownPrimitive.setValue(lastClose.value, countdown.value)
+
+  // 图表持仓线叠加层（TradingView 风格：方向/均价/数量/实时盈亏 + TP·SL 拖拽手柄）
+  positionPrimitive = new PositionLinePrimitive()
+  candleSeries.attachPrimitive(positionPrimitive)
+  syncPositionOverlay()
 
   applyData(props.data, true)
   lastLen = props.data.length
@@ -215,9 +391,11 @@ onBeforeUnmount(() => {
   document.removeEventListener('mouseup', handleMouseUp)
   window.removeEventListener('keydown', onKeydown)
   window.removeEventListener('keyup', onKeyup)
+  window.removeEventListener('mousedown', onWindowPointerDown)
   candleSeries = null
   volumeSeries = null
   primitive = null
+  positionPrimitive = null
 })
 
 function handleResize() {
@@ -427,6 +605,15 @@ watch(
     prevScopeSymbol = props.symbol ?? ''
     prevScopeDatasource = props.datasource ?? ''
     resetChartContext(scopeChanged)
+    // 跨标的切换后清空上一品种的持仓线拖拽草稿与右键菜单
+    draftSl.value = null
+    draftTp.value = null
+    bracketTarget.value = null
+    ctxMenu.value = null
+    if (mode.value === 'bracket-drag') {
+      mode.value = 'idle'
+      chart?.applyOptions({ handleScroll: { pressedMouseMove: true } })
+    }
   },
 )
 
@@ -468,6 +655,8 @@ function bindInteraction() {
   if (el) {
     el.addEventListener('mousedown', handleMouseDown)
     el.addEventListener('dblclick', handleDblClick)
+    // 右键快捷下单：需要图表的物理坐标 → 价格 / 时间
+    el.addEventListener('contextmenu', handleContextMenu)
   }
   document.addEventListener('mousemove', handleDocMove)
   document.addEventListener('mouseup', handleMouseUp)
@@ -584,8 +773,32 @@ function cancelPending() {
 
 function handleMouseDown(e: MouseEvent) {
   if (currentTool() !== 'cursor') return
+  // 仅左键参与画线 / 持仓线拖拽（右键由 contextmenu 处理，中键留给图表平移）
+  if (e.button !== 0) return
   const x = e.offsetX
   const y = e.offsetY
+
+  // 持仓线 TP/SL 右缘手柄 → 拖拽设置止盈/止损（优先于画线锚点命中）
+  if (positionPrimitive && activePosition.value) {
+    const hd = positionPrimitive.handles().find((r) => x >= r.x0 && x <= r.x1 && y >= r.y0 && y <= r.y1)
+    if (hd) {
+      e.preventDefault()
+      chart?.applyOptions({ handleScroll: { pressedMouseMove: false } })
+      const entry = activePosition.value.entryPrice
+      const price = positionPrimitive.yToPrice(y)
+      const start = price != null ? roundToTick(price, entry) : entry
+      mode.value = 'bracket-drag'
+      bracketTarget.value = hd.kind
+      if (hd.kind === 'tp') draftTp.value = start
+      else draftSl.value = start
+      // 仅当真正发生拖拽位移（≥4px）才在 mouseup 提交，防止误点手柄误下保护单
+      bracketDragStartY = e.clientY
+      bracketDragMoved = false
+      syncPositionOverlay()
+      return
+    }
+  }
+
   const hit = primitive?.hitTestObjects(drawings.value, x, y) ?? null
   if (!hit) {
     deselect()
@@ -610,6 +823,18 @@ function handleMouseDown(e: MouseEvent) {
 }
 
 function handleDocMove(e: MouseEvent) {
+  // 持仓线 TP/SL 拖拽：鼠标 y → 价格，实时更新草稿线预览
+  if (mode.value === 'bracket-drag' && positionPrimitive && activePosition.value && container.value) {
+    const rect = container.value.getBoundingClientRect()
+    if (Math.abs(e.clientY - bracketDragStartY) >= 4) bracketDragMoved = true
+    const price = positionPrimitive.yToPrice(e.clientY - rect.top)
+    if (price == null) return
+    const p = roundToTick(price, activePosition.value.entryPrice)
+    if (bracketTarget.value === 'tp') draftTp.value = p
+    else if (bracketTarget.value === 'sl') draftSl.value = p
+    syncPositionOverlay()
+    return
+  }
   if (mode.value !== 'dragging' || !dragId || !container.value) return
   const rect = container.value.getBoundingClientRect()
   const pt = primitive?.screenToPoint(e.clientX - rect.left, e.clientY - rect.top)
@@ -632,6 +857,20 @@ function handleDocMove(e: MouseEvent) {
 }
 
 function handleMouseUp() {
+  // 结束 TP/SL 手柄拖拽：恢复平移；仅在有实际位移时提交保护腿挂单
+  if (mode.value === 'bracket-drag') {
+    mode.value = 'idle'
+    chart?.applyOptions({ handleScroll: { pressedMouseMove: true } })
+    if (bracketDragMoved) {
+      void commitBracketDrag()
+    } else {
+      draftSl.value = null
+      draftTp.value = null
+      bracketTarget.value = null
+      syncPositionOverlay()
+    }
+    return
+  }
   if (mode.value === 'dragging') {
     mode.value = 'idle'
     // 恢复底图拖拽平移
@@ -650,6 +889,47 @@ function handleDblClick(e: MouseEvent) {
   drawings.value = drawings.value.filter((d) => d.id !== hit.id)
   if (selectedId.value === hit.id) deselect()
   else primitive?.setObjects(drawings.value, selectedId.value)
+}
+
+// ---- 图表右键快捷下单菜单 ----
+function handleContextMenu(e: MouseEvent) {
+  e.preventDefault()
+  const el = container.value
+  if (!el || !primitive) return
+  const rect = el.getBoundingClientRect()
+  const x = e.clientX - rect.left
+  const y = e.clientY - rect.top
+  const pt = primitive.screenToPoint(x, y)
+  if (!pt) return
+  const W = el.clientWidth
+  const H = el.clientHeight
+  ctxMenu.value = {
+    x: Math.max(2, Math.min(x, W - 196)),
+    y: Math.max(2, Math.min(y, H - 220)),
+    price: pt.price,
+    time: pt.time,
+  }
+}
+
+/** 点击菜单外部任意位置时关闭右键菜单。 */
+function onWindowPointerDown(e: MouseEvent) {
+  if (!ctxMenu.value) return
+  const t = e.target as HTMLElement | null
+  if (t && t.closest('.ctx-menu')) return
+  ctxMenu.value = null
+}
+watch(ctxMenu, (menu) => {
+  if (menu) window.addEventListener('mousedown', onWindowPointerDown)
+  else window.removeEventListener('mousedown', onWindowPointerDown)
+})
+
+/** 按价格自身精度动态格式化（右键菜单价格展示）。 */
+function fmtDynamicPrice(n: number): string {
+  if (!Number.isFinite(n)) return '--'
+  const s = String(n)
+  const dot = s.indexOf('.')
+  const dec = dot >= 0 ? Math.min(6, s.length - dot - 1) : 2
+  return n.toLocaleString('en-US', { minimumFractionDigits: Math.min(dec, 2), maximumFractionDigits: Math.max(dec, 2) })
 }
 
 // ---- 选区 / 悬浮工具栏 / 层级 ----
@@ -715,6 +995,16 @@ function onKeydown(e: KeyboardEvent) {
     e.preventDefault()
     deleteSelected()
   } else if (e.key === 'Escape') {
+    // 取消持仓线 TP/SL 拖拽（不提交保护腿）
+    if (mode.value === 'bracket-drag') {
+      mode.value = 'idle'
+      chart?.applyOptions({ handleScroll: { pressedMouseMove: true } })
+      draftSl.value = null
+      draftTp.value = null
+      bracketTarget.value = null
+      syncPositionOverlay()
+    }
+    closeCtxMenu()
     cancelPending()
     deselect()
   } else if (e.key === 'Control' || e.key === 'Meta') {
@@ -763,6 +1053,39 @@ function genId(): string {
     />
 
     <EMASettingsModal :open="!!emaSettingsId" :ema="emaSettingsObj" @close="emaSettingsId = null" />
+
+    <!-- 图表右键快捷下单菜单：自动取鼠标处价格/时间（北京时间展示） -->
+    <div
+      v-if="ctxMenu"
+      class="ctx-menu"
+      :style="{ left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }"
+      @mousedown.stop
+      @contextmenu.prevent
+    >
+      <div class="ctx-head">
+        <b>⚡ {{ fmtDynamicPrice(ctxMenu.price) }}</b>
+        <span>北京时间 {{ formatBeijingDateTime(ctxMenu.time, true) }}</span>
+      </div>
+      <button class="ctx-item buy" @click="openQuickOrder({ side: 'BUY', type: 'LIMIT', price: ctxMenu.price })">
+        在此价格买入 / 开多（限价）
+      </button>
+      <button class="ctx-item sell" @click="openQuickOrder({ side: 'SELL', type: 'LIMIT', price: ctxMenu.price })">
+        在此价格卖出 / 开空（限价）
+      </button>
+      <div class="ctx-sep"></div>
+      <button
+        class="ctx-item"
+        @click="openQuickOrder({ side: ctxReduceSide, type: 'LIMIT', price: ctxMenu.price })"
+      >
+        在此价格设置止盈（TP·限价平仓）
+      </button>
+      <button
+        class="ctx-item"
+        @click="openQuickOrder({ side: ctxReduceSide, type: 'STOP', price: ctxMenu.price })"
+      >
+        在此价格设置止损（SL·止损触发）
+      </button>
+    </div>
   </div>
 </template>
 
@@ -832,6 +1155,64 @@ function genId(): string {
 .ema-legend-btn.danger:hover {
   background: rgba(239, 83, 79, 0.2);
   color: #ef534f;
+}
+
+/* ---- 图表右键快捷下单菜单 ---- */
+.ctx-menu {
+  position: absolute;
+  z-index: 60;
+  min-width: 190px;
+  background: var(--color-bg-secondary, #1a1f26);
+  border: 1px solid var(--color-border, #1e293b);
+  border-radius: 8px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5);
+  padding: 5px;
+  user-select: none;
+}
+.ctx-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 8px 7px;
+  border-bottom: 1px solid var(--color-border, #1e293b);
+  white-space: nowrap;
+}
+.ctx-head b {
+  font-family: monospace;
+  font-size: 13px;
+  color: #3b82f6;
+}
+.ctx-head span {
+  font-size: 10px;
+  color: var(--color-text-muted, #8090a5);
+}
+.ctx-item {
+  display: block;
+  width: 100%;
+  margin-top: 3px;
+  padding: 7px 9px;
+  text-align: left;
+  background: transparent;
+  color: var(--color-text, #d1d5db);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ctx-item:hover {
+  background: var(--color-bg-tertiary, #242b34);
+  border-color: rgba(59, 130, 246, 0.4);
+}
+.ctx-item.buy { color: #26a69a; }
+.ctx-item.buy:hover { background: rgba(38, 166, 154, 0.12); }
+.ctx-item.sell { color: #ef534f; }
+.ctx-item.sell:hover { background: rgba(239, 83, 79, 0.12); }
+.ctx-sep {
+  height: 1px;
+  margin: 4px 2px;
+  background: var(--color-border, #1e293b);
 }
 </style>
 

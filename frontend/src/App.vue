@@ -15,6 +15,7 @@ import { connectMarket, connectIBKR, type WsDataType, type IBKRConnection } from
 import { useCountdown } from './composables/useCountdown'
 import type { MarketView } from './types'
 import type { DrawKind } from './types/drawing'
+import type { OrderPreset } from './types/trading'
 
 const market = useMarketStore()
 const trading = useTradingStore()
@@ -183,6 +184,11 @@ onBeforeUnmount(() => disconnect())
 function formatPrice(value?: number) {
   return value ? value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '--'
 }
+
+/** 图表右键菜单触发的快捷下单：预填表单并打开下单面板。 */
+function openQuickOrder(preset: OrderPreset) {
+  trading.openOrderPanel(preset)
+}
 </script>
 
 <template>
@@ -285,6 +291,7 @@ function formatPrice(value?: number) {
           :on-load-more-history="market.datasource === 'ibkr' ? loadMoreIBKRHistory : undefined"
           @tool-state="toolActive = $event"
           @drawing-done="onDrawingDone"
+          @open-order="openQuickOrder"
         />
         <DepthPanel
           v-else-if="market.view === 'dom'"

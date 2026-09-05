@@ -73,6 +73,18 @@ export interface Order {
   updatedAt?: number
 }
 
+/** 下单面板外部预设（图表右键菜单 / 快捷键 / 持仓线注入）：打开面板时自动预填表单。 */
+export interface OrderPreset {
+  side?: OrderSide
+  type?: OrderType
+  /** 数量（张 / 手） */
+  qty?: number
+  /** 委托价：LIMIT 为限价，STOP 为触发价 */
+  price?: number
+  stopLoss?: number
+  takeProfit?: number
+}
+
 /** 账户资金汇总 */
 export interface AccountSummary {
   /** 账户总余额（未计未实现盈亏） */

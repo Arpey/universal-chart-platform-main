@@ -24,7 +24,8 @@ const submitting = ref(false)
 const errorMsg = ref('')
 const successMsg = ref('')
 
-const isLimit = computed(() => orderType.value === 'LIMIT')
+/** 需要填价格的类型：LIMIT 委托价 / STOP 触发价。 */
+const needsPrice = computed(() => orderType.value === 'LIMIT' || orderType.value === 'STOP')
 const busy = computed(() => connecting.value || submitting.value)
 const symbol = computed(() => trading.activeSymbol || market.symbol)
 const brokerLabel = computed(() => BROKERS.find((b) => b.id === trading.currentBrokerType)?.label ?? trading.currentBrokerType)
@@ -75,8 +76,12 @@ async function onBrokerChange(type: BrokerType) {
 async function submit() {
   if (!symbol.value) { errorMsg.value = '请先选择交易品种'; return }
   if (!(qty.value > 0)) { errorMsg.value = '数量必须大于 0'; return }
-  if (isLimit.value && !(price.value && price.value > 0)) { errorMsg.value = '限价单必须填写委托价'; return }
+  if (needsPrice.value && !(price.value && price.value > 0)) { errorMsg.value = orderType.value === 'STOP' ? '止损/触发单必须填写触发价' : '限价单必须填写委托价'; return }
   if (!trading.isConnected) { errorMsg.value = 'Broker 未连接，请先连接'; return }
+
+  // 市价单前把最新行情价喂给支持实时估值的适配器（MOCK 模拟盘），
+  // 保证成交均价贴合真实行情（修正默认固定 100 造成的持仓线失真）
+  if (orderType.value === 'MARKET' && market.ticker?.price) trading.feedMarkPrice(symbol.value, market.ticker.price)
 
   const params: OrderParams = {
     symbol: symbol.value,
@@ -84,7 +89,7 @@ async function submit() {
     type: orderType.value,
     qty: qty.value,
   }
-  if (isLimit.value && price.value) params.price = price.value
+  if (needsPrice.value && price.value) params.price = price.value
   if (stopLoss.value && stopLoss.value > 0) params.stopLoss = stopLoss.value
   if (takeProfit.value && takeProfit.value > 0) params.takeProfit = takeProfit.value
 
@@ -101,6 +106,30 @@ async function submit() {
     submitting.value = false
   }
 }
+
+/** 应用外部注入的下单预设（图表右键菜单价格 / 快捷止盈止损），随后立即消费避免重复填充。 */
+function applyPreset(preset: NonNullable<typeof trading.orderPreset>): void {
+  if (preset.side) side.value = preset.side
+  if (preset.type) orderType.value = preset.type
+  if (preset.qty && preset.qty > 0) qty.value = preset.qty
+  if (preset.price && preset.price > 0) price.value = preset.price
+  if (preset.stopLoss && preset.stopLoss > 0) stopLoss.value = preset.stopLoss
+  if (preset.takeProfit && preset.takeProfit > 0) takeProfit.value = preset.takeProfit
+  errorMsg.value = ''
+  successMsg.value = ''
+}
+
+// 打开面板时若携带预设（面板可能晚于 preset 挂载 → immediate 兜底）
+watch(
+  () => trading.orderPreset,
+  (preset) => {
+    if (!preset) return
+    applyPreset(preset)
+    trading.consumeOrderPreset()
+  },
+  { immediate: true },
+)
+
 </script>
 
 <template>
@@ -133,6 +162,7 @@ async function submit() {
       <div class="of-type">
         <button type="button" class="type-btn" :class="{ active: orderType === 'MARKET' }" @click="orderType = 'MARKET'">市价</button>
         <button type="button" class="type-btn" :class="{ active: orderType === 'LIMIT' }" @click="orderType = 'LIMIT'">限价</button>
+        <button type="button" class="type-btn" :class="{ active: orderType === 'STOP' }" @click="orderType = 'STOP'">止损</button>
       </div>
     </div>
 
@@ -141,8 +171,8 @@ async function submit() {
       <input id="of-qty" v-model.number="qty" type="number" min="1" step="1" class="of-input" />
     </div>
 
-    <div v-if="isLimit" class="of-row">
-      <label class="of-label" for="of-price">委托价</label>
+    <div v-if="needsPrice" class="of-row">
+      <label class="of-label" for="of-price">{{ orderType === 'STOP' ? '触发价' : '委托价' }}</label>
       <div class="of-price">
         <input id="of-price" v-model.number="price" type="number" min="0" step="0.01" class="of-input" placeholder="0.00" />
         <button type="button" class="fill-btn" :disabled="!market.ticker" @click="fillFromMarket">当前价</button>

@@ -11,6 +11,7 @@ import type {
 } from 'lightweight-charts'
 import type { DrawObject, DrawPoint, DrawKind, LineStyle } from '../types/drawing'
 import { DEFAULT_FIB_LEVELS } from '../types/drawing'
+import { formatBeijingShort } from '../utils/beijingTime'
 
 /** 原始 K 线（供标尺计算 bars/成交量） */
 interface Kline { time: number; open: number; high: number; low: number; close: number; volume: number }
@@ -59,9 +60,8 @@ function fmtLevel(lv: number): string {
 }
 
 function formatTimeAxis(timeSec: number): string {
-  const d = new Date(timeSec * 1000)
-  const p = (v: number) => String(v).padStart(2, '0')
-  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+  // 统一北京时间（UTC+8）：显式 +8h 偏移后取 UTC 墙钟，与浏览器本地时区无关
+  return formatBeijingShort(timeSec)
 }
 
 function formatDuration(sec: number): string {
