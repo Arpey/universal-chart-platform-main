@@ -17,6 +17,8 @@ export const useMarketStore = defineStore('market', () => {
   const dom = ref<Dom>()
   const trades = ref<TradeTick[]>([])
   const domConnected = ref(false)
+  /** 最近一次收到行情数据的时间戳（epoch ms）：用于判断当前是否处于"已连接但无新行情"的休市/低流动性静默期。 */
+  const lastDataAt = ref(0)
 
   async function load() {
     loading.value = true; error.value = ''
@@ -125,10 +127,12 @@ export const useMarketStore = defineStore('market', () => {
     quote.value = undefined
     dom.value = undefined
     trades.value = []
+    lastDataAt.value = 0
   }
 
   function update(kline: Kline) {
     if (!kline || typeof kline.time !== 'number') return
+    lastDataAt.value = Date.now()
     const last = klines.value.at(-1)
     if (last?.time === kline.time) klines.value[klines.value.length - 1] = kline
     else klines.value.push(kline)
@@ -142,6 +146,7 @@ export const useMarketStore = defineStore('market', () => {
    */
   function applyHist(rows: Kline[], append = false) {
     if (!Array.isArray(rows)) return
+    lastDataAt.value = Date.now()
     const seen = new Map<number, Kline>()
     const source = append ? klines.value : []
     for (const k of source) {
@@ -184,6 +189,7 @@ export const useMarketStore = defineStore('market', () => {
   /** 更新顶部最新价（实时流驱动）。 */
   function setPrice(price: number) {
     if (!Number.isFinite(price) || price <= 0) return
+    lastDataAt.value = Date.now()
     const base = ticker.value ?? { symbol: symbol.value, change24h: 0, volume24h: 0, updatedAt: Date.now() }
     ticker.value = { ...base, price, updatedAt: Date.now() }
   }
@@ -191,7 +197,7 @@ export const useMarketStore = defineStore('market', () => {
   return {
     datasource, currentSource, availableSources, view, symbol, interval, klines, ticker, loading, error,
     symbols, tickers, universeLoading, universeError,
-    quote, dom, trades, domConnected,
+    quote, dom, trades, domConnected, lastDataAt,
     load, loadUniverse, setDatasource, switchSource, setView, setSymbol,
     update, applyHist, setQuote, setDom, addTrade, setPrice,
     applySymbols,

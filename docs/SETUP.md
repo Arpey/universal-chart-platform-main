@@ -18,6 +18,8 @@ cd frontend && cp .env.example .env && npm install && npm run dev
 - 后端默认通过**本地代理**访问币安：`HTTPS_PROXY=http://127.0.0.1:10808`（V2rayN/Clash 等）。可在 `backend/.env` 用 `HTTPS_PROXY` 覆盖，例如 `http://127.0.0.1:10809`。
   - REST 走 `undici ProxyAgent`，WebSocket 走 `ws` + `HttpsProxyAgent`，二者都支持 HTTP CONNECT 代理。
 - 若后端返回 `502` 且消息为 `Service unavailable from a restricted location ... (451)`，表示**代理出口 IP 所在地区被币安封锁**（如美国 IP），请更换代理节点国家（港/日/新等）。
+- 若 REST（历史 K 线 / ticker）正常但实时 WS 不推送，通常是代理出口被币安**静默屏蔽 `fstream`**（握手成功但永不推数据）。后端已内置 REST 兜底：WS 超过 20s 无推送自动降级为 `fapi/v1/klines` 轮询保活图表，WS 恢复后自动切回（日志 `启用 REST kline 轮询兜底`）。如需真正实时推送，请更换可访问 `fstream.binance.com` 的代理节点。
+- TradeFi 品种（XAUUSDT/SPXUSDT/NVDAUSDT 等）属于币安 `TRADIFI_PERPETUAL` 合约，脚本/代码筛选合约时需同时匹配 `PERPETUAL` 与 `TRADIFI_PERPETUAL`。
 
 ## 接口
 

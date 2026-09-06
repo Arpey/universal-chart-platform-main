@@ -70,7 +70,9 @@ export class BinanceAdapter extends BaseAdapter implements MarketDataAdapter {
     if (!response.ok) throw new Error(`Binance Futures exchangeInfo failed: ${response.status} ${await response.text()}`)
     const info = await response.json() as { symbols: Array<{ symbol: string; baseAsset: string; quoteAsset: string; contractType: string; status: string }> }
     const rows = info.symbols
-      .filter((s) => s.quoteAsset === 'USDT' && s.contractType === 'PERPETUAL' && s.status === 'TRADING')
+      // 同时纳入 PERPETUAL 与 TRADIFI_PERPETUAL（XAUUSDT/XAGUSDT/NVDAUSDT 等 TradFi 永续），
+      // 避免备用现货/合约数据源重蹈"TradFi 合约整类丢失"的覆辙。
+      .filter((s) => s.quoteAsset === 'USDT' && ['PERPETUAL', 'TRADIFI_PERPETUAL'].includes(s.contractType) && s.status === 'TRADING')
       .map((s) => ({ symbol: s.symbol, baseAsset: s.baseAsset, quoteAsset: s.quoteAsset }))
     this.symbolsCache = { data: rows, at: Date.now() }
     return rows

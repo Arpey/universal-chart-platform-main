@@ -311,7 +311,7 @@ function openQuickOrder(preset: OrderPreset) {
     <!-- 下单面板：默认折叠，点击顶栏“下单”按钮以右侧抽屉展开 -->
     <TradingPanel />
 
-    <StatusBar :connected="connected" :count="market.klines.length" :datasource="currentSourceLabel" :view="market.view" />
+    <StatusBar :connected="connected" :count="market.klines.length" :datasource="currentSourceLabel" :view="market.view" :interval="market.interval" :last-data-at="market.lastDataAt" />
     <SymbolSearchModal v-model:open="searchOpen" />
     <IndicatorsModal :open="indicatorModalOpen" @close="indicatorModalOpen = false" />
   </main>

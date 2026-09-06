@@ -75,11 +75,34 @@ export const config = {
 }
 
 // ===== TradeFi 白名单分类（基于币安 U 本位合约，非独立数据源） =====
-/** tradefi 分类允许的交易对白名单（逗号分隔，如 XAUUSDT,NVDAUSDT）。 */
-export const TRADEFI_SYMBOLS: string[] = (process.env.TRADEFI_SYMBOLS ?? '')
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean)
+/**
+ * 常用 TradFi / 大宗商品 / 美股合约预设（代码内置默认值，可用 TRADEFI_SYMBOLS 覆盖）。
+ * 均为币安 USDⓈ-M 合约实际/候选代码，最终会与 fapi/v1/exchangeInfo 实时取交集：
+ * 已上架（如 XAUUSDT/XAGUSDT/SPXUSDT 与美股 TradFi 永续）直接展示；尚未上架或已下架
+ * 的候选（如股指/能源类变体）自动不可见，避免出现无法拉行情的死标的。
+ */
+const DEFAULT_TRADEFI_SYMBOLS = [
+  // 股指/指数永续
+  'SPXUSDT',
+  // 贵金属 / 大宗商品（金、银、铜、Tether/Pax 黄金）
+  'XAUUSDT', 'XAGUSDT', 'COPPERUSDT', 'XAUTUSDT', 'PAXGUSDT',
+  // 美股权益类 TradFi 永续
+  'NVDAUSDT', 'TSLAUSDT', 'AAPLUSDT', 'MSFTUSDT', 'AMZNUSDT', 'METAUSDT', 'AVGOUSDT',
+  'INTCUSDT', 'IBMUSDT', 'UBERUSDT', 'BABAUSDT', 'SOXLUSDT', 'SQQQUSDT',
+  'COINUSDT', 'MSTRUSDT', 'PLTRUSDT', 'ORCLUSDT', 'QCOMUSDT', 'AMDUSDT', 'NFLXUSDT', 'SHOPUSDT',
+]
+
+/** tradefi 分类允许的交易对白名单：优先取环境变量；未配置/为空时回退到内置预设列表。 */
+export const TRADEFI_SYMBOLS: string[] = (() => {
+  const raw = (process.env.TRADEFI_SYMBOLS ?? '').trim()
+  if (raw) {
+    return raw
+      .split(',')
+      .map((s) => s.trim().toUpperCase())
+      .filter(Boolean)
+  }
+  return [...DEFAULT_TRADEFI_SYMBOLS]
+})()
 
 /** 全部模式（binance）下是否隐藏 TRADEFI_SYMBOLS 中的品种。 */
 export const HIDE_TRADEFI_IN_BINANCE = process.env.HIDE_TRADEFI_IN_BINANCE === 'true'

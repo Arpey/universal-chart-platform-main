@@ -350,6 +350,17 @@ footer {
   margin-left: auto;
 }
 
+/* 休市/低流动性静默提示（已连接但长期无新行情，区别于连接中断） */
+.idle {
+  color: #d4a72c;
+  background: rgba(212, 167, 44, 0.12);
+  border: 1px solid rgba(212, 167, 44, 0.25);
+  border-radius: 4px;
+  padding: 1px 6px;
+  margin-left: 4px;
+  white-space: nowrap;
+}
+
 /* ===== ECharts 主题调整 ===== */
 .echarts-container {
   width: 100%;

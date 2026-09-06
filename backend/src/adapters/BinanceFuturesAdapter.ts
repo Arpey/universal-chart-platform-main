@@ -12,12 +12,19 @@ import { logger } from '../utils/logger'
  * 币安 U 本位永续合约（USDT-M Futures）适配器。
  * - REST:  fapi.binance.com/fapi/v1
  * - WS:    fstream.binance.com/ws/<symbol>@kline_<interval>（永续 symbol 为小写且不带 _ 后缀）
+ * - 覆盖两类可交易合约：PERPETUAL（普通 USDT 永续）与 TRADIFI_PERPETUAL
+ *   （币安 TradFi/大宗商品/美股权益类永续，如 XAUUSDT/XAGUSDT/NVDAUSDT），
+ *   二者均通过同一套 REST/WS 接口取数。
  * - 可选 symbolWhitelist 白名单：'tradefi' 分类用它只返回/允许白名单内的合约，
  *   并对 K 线、逐笔、行情订阅做白名单校验（越权品种直接拒绝）；
  *   未传白名单时行为与原来一致（全量 USDT 永续），HIDE_TRADEFI_IN_BINANCE 可控制是否隐藏 tradefi 品种。
- * 请求通过本地代理（HTTP CONNECT）发出，以绕开网络封锁。
+ * - REST 请求带超时并对网络/超时类错误自动重试一次；请求通过本地代理（HTTP CONNECT）发出。
+ * - WS 实时流内置 REST 轮询兜底：fstream 断开或长时间无推送（地区屏蔽/休市）时自动降级为
+ *   fapi/v1/klines 轮询保活图表，WS 恢复推送后自动切回。
  */
 export class BinanceFuturesAdapter extends BaseAdapter implements MarketDataAdapter {
+  /** 可参与展示/订阅的合约类型：普通永续 + 币安 TradFi 永续。 */
+  private static readonly CONTRACT_TYPES = new Set(['PERPETUAL', 'TRADIFI_PERPETUAL'])
   private readonly dispatcher = new ProxyAgent(config.proxy)
 
   /** 可选交易对白名单（tradefi 分类）：为空数组/未传表示不过滤。 */
@@ -38,13 +45,43 @@ export class BinanceFuturesAdapter extends BaseAdapter implements MarketDataAdap
     }
   }
 
+  /**
+   * 带超时与重试的币安 REST GET（幂等，可安全重试一次）：
+   * - 网络错误 / 超时 / 5xx 属于瞬时故障，退避后自动重试一次；
+   * - 4xx 属于业务/参数错误（如代码不存在），直接抛出，重试无意义。
+   */
+  private async requestJson<T>(url: string, label: string, timeoutMs = 10_000): Promise<T> {
+    const attempts = 2
+    let lastError: Error | null = null
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), timeoutMs)
+      try {
+        const response = await undiciFetch(url, { dispatcher: this.dispatcher, signal: controller.signal })
+        if (!response.ok) {
+          const text = (await response.text()).slice(0, 200)
+          throw new Error(`${label} failed: HTTP ${response.status} ${text}`)
+        }
+        return await response.json() as T
+      } catch (err) {
+        const aborted = err instanceof Error && (err.name === 'AbortError' || /abort/i.test(err.message))
+        lastError = aborted
+          ? new Error(`${label} timed out after ${timeoutMs}ms`)
+          : err instanceof Error ? err : new Error(String(err))
+        if (/^HTTP [45]\d\d/.test(lastError.message)) break
+      } finally {
+        clearTimeout(timer)
+      }
+      if (attempt < attempts) await new Promise((resolve) => setTimeout(resolve, 300 * attempt))
+    }
+    throw lastError ?? new Error(`${label} failed`)
+  }
+
   /** 过滤成交量为 0 的无效对（白名单模式下），失败时退回原列表。 */
   private async filterZeroVolume(rows: SymbolInfo[]): Promise<SymbolInfo[]> {
     try {
       const url = `${config.futuresBaseUrl}/fapi/v1/ticker/24hr`
-      const response = await undiciFetch(url, { dispatcher: this.dispatcher })
-      if (!response.ok) return rows
-      const tickers = await response.json() as Array<Record<string, string>>
+      const tickers = await this.requestJson<Array<Record<string, string>>>(url, 'Binance Futures 24hr tickers')
       const active = new Set(tickers.filter((t) => Number(t.quoteVolume) > 0).map((t) => t.symbol))
       return rows.filter((s) => active.has(s.symbol))
     } catch {
@@ -59,9 +96,8 @@ export class BinanceFuturesAdapter extends BaseAdapter implements MarketDataAdap
   async getKlines(symbol: string, interval: Interval, limit = 300): Promise<Kline[]> {
     this.assertAllowed(symbol)
     const url = `${config.futuresBaseUrl}/fapi/v1/klines?symbol=${symbol.toUpperCase()}&interval=${interval}&limit=${limit}`
-    const response = await undiciFetch(url, { dispatcher: this.dispatcher })
-    if (!response.ok) throw new Error(`Binance Futures request failed: ${response.status} ${await response.text()}`)
-    const rows = await response.json() as unknown[][]
+    const rows = await this.requestJson<unknown[][]>(url, `Binance Futures klines(${symbol})`)
+    // 币安 REST 数组格式 → 项目统一 Kline：毫秒时间戳换算为秒（与全项目/lightweight-charts 一致）
     return rows.map((row) => ({
       time: Number(row[0]) / 1000,
       open: Number(row[1]),
@@ -75,9 +111,7 @@ export class BinanceFuturesAdapter extends BaseAdapter implements MarketDataAdap
   async getTicker(symbol: string): Promise<Ticker> {
     this.assertAllowed(symbol)
     const url = `${config.futuresBaseUrl}/fapi/v1/ticker/24hr?symbol=${symbol.toUpperCase()}`
-    const response = await undiciFetch(url, { dispatcher: this.dispatcher })
-    if (!response.ok) throw new Error(`Binance Futures ticker request failed: ${response.status} ${await response.text()}`)
-    const data = await response.json() as Record<string, string>
+    const data = await this.requestJson<Record<string, string>>(url, `Binance Futures ticker(${symbol})`)
     return {
       symbol: data.symbol,
       price: Number(data.lastPrice),
@@ -87,17 +121,17 @@ export class BinanceFuturesAdapter extends BaseAdapter implements MarketDataAdap
     }
   }
 
-  /** 拉取全部 USDT 报价的永续合约列表，用于前端搜索。交易对列表几乎不变，缓存 5 分钟。 */
+  /** 拉取全部 USDT 报价的永续/TradFi 永续合约列表，用于前端搜索。交易对列表几乎不变，缓存 5 分钟。 */
   async getSymbols(): Promise<SymbolInfo[]> {
     if (this.symbolsCache && Date.now() - this.symbolsCache.at < 5 * 60_000) {
       return this.symbolsCache.data
     }
     const url = `${config.futuresBaseUrl}/fapi/v1/exchangeInfo`
-    const response = await undiciFetch(url, { dispatcher: this.dispatcher })
-    if (!response.ok) throw new Error(`Binance Futures exchangeInfo failed: ${response.status} ${await response.text()}`)
-    const info = await response.json() as { symbols: Array<{ symbol: string; baseAsset: string; quoteAsset: string; contractType: string; status: string }> }
+    const info = await this.requestJson<{ symbols: Array<{ symbol: string; baseAsset: string; quoteAsset: string; contractType: string; status: string }> }>(url, 'Binance Futures exchangeInfo')
+    // 同时纳入 PERPETUAL 与 TRADIFI_PERPETUAL：XAUUSDT/XAGUSDT/NVDAUSDT 等
+    // TradFi/大宗商品/美股合约属于后者，仅筛 PERPETUAL 会整类丢失。
     let rows = info.symbols
-      .filter((s) => s.quoteAsset === 'USDT' && s.contractType === 'PERPETUAL' && s.status === 'TRADING')
+      .filter((s) => s.quoteAsset === 'USDT' && BinanceFuturesAdapter.CONTRACT_TYPES.has(s.contractType) && s.status === 'TRADING')
       .map((s) => ({ symbol: s.symbol, baseAsset: s.baseAsset, quoteAsset: s.quoteAsset }))
 
     if (this.symbolWhitelist.length > 0) {
@@ -115,15 +149,13 @@ export class BinanceFuturesAdapter extends BaseAdapter implements MarketDataAdap
     return rows
   }
 
-  /** 拉取全部 USDT 永续合约的 24h 行情快照，用于交易对搜索列表实时展示。缓存 5 秒。 */
+  /** 拉取全部 USDT 永续合约（含 TradFi 永续）的 24h 行情快照，用于交易对搜索列表实时展示。缓存 5 秒。 */
   async getAllTickers(): Promise<Ticker[]> {
     if (this.tickersCache && Date.now() - this.tickersCache.at < 5_000) {
       return this.tickersCache.data
     }
     const url = `${config.futuresBaseUrl}/fapi/v1/ticker/24hr`
-    const response = await undiciFetch(url, { dispatcher: this.dispatcher })
-    if (!response.ok) throw new Error(`Binance Futures tickers failed: ${response.status} ${await response.text()}`)
-    let rows = (await response.json() as Array<Record<string, string>>)
+    let rows = (await this.requestJson<Array<Record<string, string>>>(url, 'Binance Futures tickers'))
       .filter((t) => t.symbol.endsWith('USDT'))
       .map((t) => ({
         symbol: t.symbol,
@@ -157,17 +189,96 @@ export class BinanceFuturesAdapter extends BaseAdapter implements MarketDataAdap
     const url = `${config.futuresWsUrl}/${stream}`
     const agent = new HttpsProxyAgent(config.proxy) // 复用一个 agent，避免重连时反复新建
 
+    // ---- REST 兜底轮询参数（fstream 断流/被静默屏蔽或休市时保活图表）----
+    const intervalSec = ({ '1m': 60, '5m': 300, '15m': 900, '1h': 3600, '4h': 14400, '1d': 86400 } as Record<string, number>)[interval] ?? 60
+    const basePollMs = Math.min(Math.max((intervalSec * 1000) / 5, 4_000), 12_000)
+    const FALLBACK_GRACE_MS = 20_000 // WS 连续无 K 线推送多久后启用 REST 兜底（兼容休市/代理静默断流）
+    const SUPERVISOR_MS = 5_000
+
     let socket: WebSocket | null = null
     let stopped = false
     let retries = 0
     let isAlive = false
-    let lastMessageAt = 0 // 无数据看门狗：记录最近一次消息到达时间
+    let lastMessageAt = 0 // WS 监管基准：最近一次收到上游消息
     let pingTimer: ReturnType<typeof setInterval> | null = null
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+    let supervisorTimer: ReturnType<typeof setInterval> | null = null
+    // REST 兜底状态机
+    let fallbackActive = false
+    let fallbackTimer: ReturnType<typeof setTimeout> | null = null
+    let noChangeStreak = 0 // 连续轮询无变化的次数（用于休市时自动放慢节奏）
+    let lastEmitKey = ''   // 最近一次经兜底推送的 K 线指纹，避免重复推送
+    let warnedRest = false
 
     const clearTimers = () => {
       if (pingTimer) { clearInterval(pingTimer); pingTimer = null }
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
+      if (supervisorTimer) { clearInterval(supervisorTimer); supervisorTimer = null }
+    }
+
+    /** 停掉 REST 兜底轮询（WS 恢复推送 / 订阅取消时调用）。 */
+    const stopFallback = (reason?: string) => {
+      if (!fallbackActive) return
+      fallbackActive = false
+      if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null }
+      if (reason) logger.info(`[BinanceFutures] 已停 REST 兜底，切回 WS 推送: ${stream}（${reason}）`)
+    }
+
+    /** 单轮 REST 兜底拉取：仅推送有变化的最后一根 K 线；持续无变化（休市）自动放缓频率。 */
+    const pollOnce = async () => {
+      fallbackTimer = null
+      if (stopped || !fallbackActive) return
+      try {
+        const bars = await this.getKlines(symbol, interval, 5)
+        if (stopped || !fallbackActive) return
+        const newest = bars.at(-1)
+        if (newest) {
+          const key = `${newest.time}|${newest.open}|${newest.high}|${newest.low}|${newest.close}|${newest.volume}`
+          if (key !== lastEmitKey) {
+            lastEmitKey = key
+            noChangeStreak = 0
+            onKline(newest)
+          } else {
+            noChangeStreak += 1
+          }
+        }
+      } catch (err) {
+        // REST 兜底失败（代理/网络抖动）不中断循环，告警仅记一次避免刷屏
+        if (!warnedRest) {
+          warnedRest = true
+          const detail = err instanceof Error ? err.message : String(err)
+          logger.warn(`[BinanceFutures] REST 兜底拉取失败: ${stream}（${detail}）`)
+        }
+      }
+      // 自适应节奏：持续无变化逐步放慢到 ~60s，恢复成交后回到快速轮询
+      const backoff = Math.min(noChangeStreak, 4)
+      const waitMs = Math.min(basePollMs * 2 ** backoff, 60_000)
+      fallbackTimer = setTimeout(pollOnce, waitMs)
+    }
+
+    /** 启动 REST 兜底（幂等）。 */
+    const startFallback = (reason: string) => {
+      if (fallbackActive || stopped) return
+      fallbackActive = true
+      noChangeStreak = 0
+      warnedRest = false
+      logger.warn(`[BinanceFutures] ${reason}，启用 REST kline 轮询兜底: ${stream}`)
+      fallbackTimer = setTimeout(pollOnce, 0)
+    }
+
+    /** 监管定时器：WS 推送新鲜 → 停掉兜底切回 WS；WS 静默/断开超时 → 拉起兜底。 */
+    const armSupervisor = () => {
+      if (stopped) return
+      supervisorTimer = setInterval(() => {
+        if (stopped) return
+        const wsAlive = !!socket && socket.readyState === WebSocket.OPEN
+        const wsFresh = wsAlive && Date.now() - lastMessageAt < FALLBACK_GRACE_MS
+        if (wsFresh) {
+          stopFallback('WS 已恢复 K 线推送')
+        } else if (!fallbackActive) {
+          startFallback(wsAlive ? 'WS 已连接但超过 20s 无 K 线推送（断流或休市）' : 'WS 断开/重连中')
+        }
+      }, SUPERVISOR_MS)
     }
 
     const connect = () => {
@@ -179,13 +290,6 @@ export class BinanceFuturesAdapter extends BaseAdapter implements MarketDataAdap
         isAlive = true
         lastMessageAt = Date.now() // 以本次连接建立时刻为基准
         logger.info(`[BinanceFutures] WS 已连接: ${stream}`)
-        // 无数据看门狗：连接后 10s 内未收到任何消息则告警（典型场景：代理节点被币安静默断流，连接正常但无数据）
-        setTimeout(() => {
-          if (stopped) return
-          if (Date.now() - lastMessageAt > 10_000) {
-            logger.warn(`[BinanceFutures] 已连接但 10s 内未收到数据，请检查代理节点/网络/数据源: ${stream}`)
-          }
-        }, 10_000)
         // 心跳：每 20s ping 一次；下一轮仍未收到 pong 则判死并强制重连
         pingTimer = setInterval(() => {
           if (!socket) return
@@ -202,7 +306,7 @@ export class BinanceFuturesAdapter extends BaseAdapter implements MarketDataAdap
       socket.on('pong', () => { isAlive = true })
 
       socket.on('message', (raw) => {
-        lastMessageAt = Date.now() // 看门狗基准：任一消息到达即刷新
+        lastMessageAt = Date.now() // 监管基准：任一上游消息到达即视为 WS 存活/有推送
 
         // 解析错误与 onKline 回调异常分开记录，避免转发层异常被误报为“消息解析失败”
         let data: { k: Record<string, string | number> }
@@ -242,15 +346,18 @@ export class BinanceFuturesAdapter extends BaseAdapter implements MarketDataAdap
         const delay = Math.min(1000 * 2 ** retries, 30_000) + Math.floor(Math.random() * 500)
         retries += 1
         logger.warn(`[BinanceFutures] WS 断开，${(delay / 1000).toFixed(1)}s 后重连: ${stream}`)
+        // 断线/重连等待期间由监管器自动拉起 REST 兜底，图表不因 WS 断开而停更
         reconnectTimer = setTimeout(connect, delay)
       })
     }
 
     connect()
+    armSupervisor()
 
     return () => {
       stopped = true // 置位后 close 回调不会再触发重连
       clearTimers()
+      stopFallback()
       socket?.close()
       socket = null
     }
