@@ -6,11 +6,11 @@ import { fetchMarket, fetchSymbols, fetchTickers } from '../services/chartServic
 const DEFAULT_SYMBOL: Record<DataSource, string> = { binance: 'BTCUSDT', tradovate: 'NQ', tradefi: 'XAUUSDT', ibkr: 'MES' }
 
 export const useMarketStore = defineStore('market', () => {
-  const datasource = ref<DataSource>('binance')
+  const datasource = ref<DataSource>('ibkr')
   /** 当前分类：全部合约 / Tradefi（与 datasource 保持同步，tradovate 不在分类内）。 */
-  const currentSource = ref<Source>('binance')
+  const currentSource = ref<Source>('ibkr')
   const view = ref<MarketView>('candlestick')
-  const symbol = ref(DEFAULT_SYMBOL.binance); const interval = ref<Interval>('1m'); const klines = ref<Kline[]>([]); const ticker = ref<Ticker>(); const loading = ref(false); const error = ref('')
+  const symbol = ref(DEFAULT_SYMBOL.ibkr); const interval = ref<Interval>('1m'); const klines = ref<Kline[]>([]); const ticker = ref<Ticker>(); const loading = ref(false); const error = ref('')
   const symbols = ref<SymbolInfo[]>([]); const tickers = ref<Ticker[]>([]); const universeLoading = ref(false); const universeError = ref('')
   // Tradovate 实时流：报价 / 盘口 / 逐笔
   const quote = ref<Quote>()
