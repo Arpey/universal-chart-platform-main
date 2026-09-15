@@ -48,4 +48,11 @@ export interface MarketDataAdapter extends MarketAdapter {
   ping?(): Promise<void>
   /** 底层连接状态订阅（可选，IBKR 断线/重连时广播给 WebSocket 客户端） */
   onStatus?(listener: (connected: boolean, error?: Error) => void): () => void
+  /**
+   * 行情类型变更订阅（可选，IBKR：1=实时 2=冻结 3=延迟 4=延迟冻结）。
+   * 用于前端展示「实时行情 / 延迟行情」，避免用户把延迟数据误判为断流。
+   */
+  onMarketDataType?(listener: (marketDataType: number) => void): () => void
+  /** 当前生效的行情类型（可选，IBKR：1=实时 3=延迟；尚未收到 IB 通知时为 null） */
+  getMarketDataType?(): number | null
 }

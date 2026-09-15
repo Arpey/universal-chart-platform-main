@@ -1,5 +1,6 @@
 import { BaseAdapter } from './BaseAdapter'
 import { IBKRClient, IBKR_CME_SYMBOLS } from '../services/IBKRClient'
+import type { IBKRStatus } from '../services/IBKRClient'
 import type { MarketDataAdapter, SymbolInfo } from '../types/adapter'
 import type { Interval, Kline } from '../types/kline'
 import type { Ticker } from '../types/market'
@@ -15,7 +16,8 @@ import { logger } from '../utils/logger'
  * - reqRealTimeBars 实时 K 线 → { symbol, time, open, high, low, close, volume }（WS 增量广播）
  *
  * 通过 subscribeTick / subscribeBar 注册的回调实时输出（供 WebSocketServer 广播给前端）。
- * 延迟行情（MarketDataType.DELAYED）免费可用，未付费订阅也能获取测试数据。
+ * 行情类型（实时 / 延迟）由 backend/.env 的 IBKR_MARKET_DATA_TYPE 控制（默认实时），
+ * 无实时权限时 IBKRClient 会自动回退延迟行情，并通过 onMarketDataType 通知前端展示。
  */
 export class IBKRAdapter extends BaseAdapter implements MarketDataAdapter {
   private readonly client = new IBKRClient()
@@ -57,7 +59,7 @@ export class IBKRAdapter extends BaseAdapter implements MarketDataAdapter {
   /**
    * K 线订阅（与 URL 参数流的 kline 协议兼容）：
    * - onHist：reqHistoricalData 一次性全量历史（300 根）；
-   * - onKline：reqRealTimeBars 实时增量（TWS 固定 5 秒 bar，延迟行情账户可能被拒，仅提示）。
+   * - onKline：reqRealTimeBars 实时增量（TWS 固定 5 秒 bar；仅实时行情支持，延迟行情下由 IBKRClient 自动跳过并回调 onError 提示）。
    */
   subscribe(
     symbol: string,
@@ -138,6 +140,21 @@ export class IBKRAdapter extends BaseAdapter implements MarketDataAdapter {
   /** 监听底层 IB Gateway / TWS 连接状态（供 WebSocketServer 广播给客户端）。 */
   onStatus(listener: (connected: boolean, error?: Error) => void): () => void {
     return this.client.onStatus(listener)
+  }
+
+  /** 监听行情类型变更（1=实时 2=冻结 3=延迟 4=延迟冻结），供 WebSocketServer 广播给前端展示。 */
+  onMarketDataType(listener: (marketDataType: number) => void): () => void {
+    return this.client.onMarketDataType(listener)
+  }
+
+  /** 当前生效的行情类型（1=实时 3=延迟）；尚未收到 IB 通知时为 null。 */
+  getMarketDataType(): number | null {
+    return this.client.getMarketDataType()
+  }
+
+  /** 运行状态快照（GET /api/ibkr/status）。 */
+  getStatus(): IBKRStatus {
+    return this.client.getStatus()
   }
 
   /** 关闭底层连接（进程退出时调用）。 */

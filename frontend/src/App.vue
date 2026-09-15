@@ -146,6 +146,8 @@ function refresh() {
       onTick: market.addTrade,
       onKline: market.update,
       onHist: market.applyHist,
+      // 后端回报本条订阅实际生效的行情类型（1=实时 / 3=延迟），用于状态栏标注
+      onMarketDataType: market.setIbkrMarketDataType,
       onState: (value) => { connected.value = value },
       onError: (message) => { market.error = message },
     })
@@ -311,7 +313,7 @@ function openQuickOrder(preset: OrderPreset) {
     <!-- 下单面板：默认折叠，点击顶栏“下单”按钮以右侧抽屉展开 -->
     <TradingPanel />
 
-    <StatusBar :connected="connected" :count="market.klines.length" :datasource="currentSourceLabel" :view="market.view" :interval="market.interval" :last-data-at="market.lastDataAt" />
+    <StatusBar :connected="connected" :count="market.klines.length" :datasource="currentSourceLabel" :view="market.view" :interval="market.interval" :last-data-at="market.lastDataAt" :market-data-type="market.ibkrMarketDataType" />
     <SymbolSearchModal v-model:open="searchOpen" />
     <IndicatorsModal :open="indicatorModalOpen" @close="indicatorModalOpen = false" />
   </main>

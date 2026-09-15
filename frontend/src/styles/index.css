@@ -361,6 +361,27 @@ footer {
   white-space: nowrap;
 }
 
+/* IBKR 行情类型提示（实时 / 延迟；延迟行情 CME 约延迟 10 分钟，避免误判为断流） */
+.md-live {
+  color: #26a69a;
+  background: rgba(38, 166, 154, 0.12);
+  border: 1px solid rgba(38, 166, 154, 0.28);
+  border-radius: 4px;
+  padding: 1px 6px;
+  margin-left: 4px;
+  white-space: nowrap;
+}
+
+.md-delayed {
+  color: #d4a72c;
+  background: rgba(212, 167, 44, 0.12);
+  border: 1px solid rgba(212, 167, 44, 0.25);
+  border-radius: 4px;
+  padding: 1px 6px;
+  margin-left: 4px;
+  white-space: nowrap;
+}
+
 /* ===== ECharts 主题调整 ===== */
 .echarts-container {
   width: 100%;

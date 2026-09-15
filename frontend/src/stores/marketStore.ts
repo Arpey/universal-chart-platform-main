@@ -19,6 +19,11 @@ export const useMarketStore = defineStore('market', () => {
   const domConnected = ref(false)
   /** 最近一次收到行情数据的时间戳（epoch ms）：用于判断当前是否处于"已连接但无新行情"的休市/低流动性静默期。 */
   const lastDataAt = ref(0)
+  /**
+   * IBKR 实际生效的行情类型：1=实时 / 2=冻结 / 3=延迟（CME 约延迟 10 分钟）/ 4=延迟冻结；null=未知。
+   * 由后端 WS { type: 'marketdata' } 消息驱动，用于状态栏标注，避免把延迟数据误判为断流。
+   */
+  const ibkrMarketDataType = ref<number | null>(null)
 
   async function load() {
     loading.value = true; error.value = ''
@@ -128,6 +133,7 @@ export const useMarketStore = defineStore('market', () => {
     dom.value = undefined
     trades.value = []
     lastDataAt.value = 0
+    ibkrMarketDataType.value = null
   }
 
   function update(kline: Kline) {
@@ -194,12 +200,17 @@ export const useMarketStore = defineStore('market', () => {
     ticker.value = { ...base, price, updatedAt: Date.now() }
   }
 
+  /** 接收后端回报的 IBKR 行情类型（1=实时 / 3=延迟），供状态栏标注「实时行情 / 延迟行情」。 */
+  function setIbkrMarketDataType(next: number | null) {
+    ibkrMarketDataType.value = typeof next === 'number' && Number.isFinite(next) ? next : null
+  }
+
   return {
     datasource, currentSource, availableSources, view, symbol, interval, klines, ticker, loading, error,
     symbols, tickers, universeLoading, universeError,
-    quote, dom, trades, domConnected, lastDataAt,
+    quote, dom, trades, domConnected, lastDataAt, ibkrMarketDataType,
     load, loadUniverse, setDatasource, switchSource, setView, setSymbol,
-    update, applyHist, setQuote, setDom, addTrade, setPrice,
+    update, applyHist, setQuote, setDom, addTrade, setPrice, setIbkrMarketDataType,
     applySymbols,
     clearMarketData,
   }

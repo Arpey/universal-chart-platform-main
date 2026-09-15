@@ -22,6 +22,22 @@ function resolveIBKRClientId(): number {
   return Math.floor(Math.random() * 1000) + 1
 }
 
+/** IBKR 行情类型（MarketDataType）：realtime=实时(1) / frozen=冻结(2) / delayed=延迟(3) / delayed-frozen=延迟冻结(4)。 */
+export type IBKRMarketDataTypeSetting = 'realtime' | 'frozen' | 'delayed' | 'delayed-frozen'
+
+/**
+ * 解析 IBKR_MARKET_DATA_TYPE：
+ * - 默认 realtime（已订阅 CME 实时行情时取实时数据，5 秒实时 K 线 / 逐笔才可用）；
+ * - 显式配 delayed 可强制使用免费延迟行情（CME 约延迟 10 分钟）；
+ * - 配 realtime 但账号无实时权限时，IBKRClient 会依据 IB 的 10167/354 错误自动回退到 delayed，
+ *   避免出现「完全拿不到数据」，因此不需要手工在 delayed/realtime 之间来回切换。
+ */
+function resolveIBKRMarketDataType(): IBKRMarketDataTypeSetting {
+  const raw = (process.env.IBKR_MARKET_DATA_TYPE ?? 'realtime').trim().toLowerCase().replace(/_/g, '-')
+  if (raw === 'frozen' || raw === 'delayed' || raw === 'delayed-frozen') return raw
+  return 'realtime'
+}
+
 export const config = {
   port: Number(process.env.PORT ?? 3001),
   corsOrigin: process.env.CORS_ORIGIN ?? 'http://localhost:5173',
@@ -55,13 +71,17 @@ export const config = {
   },
   // 数据源：IBKR（盈透证券，CME 期货行情）
   // - 连接本地 IB Gateway / TWS 的 API 端口（默认 4001，可用 IBKR_PORT 覆盖；IB Gateway 实盘 4001 / 模拟 4002）；
-  // - 连接成功后自动启用延迟行情（MarketDataType.DELAYED = 3），未付费订阅也可免费获取测试数据。
+  // - 连接成功后按 IBKR_MARKET_DATA_TYPE 请求行情类型（默认实时 = 1）；无实时权限时自动回退延迟行情（3）。
   ibkr: {
     enabled: process.env.IBKR_ENABLED === 'true',
     // 显式绑定 127.0.0.1，避免 localhost 解析为 IPv6 ::1 导致 TWS/IB Gateway 连接被拒
     host: process.env.IBKR_HOST ?? '127.0.0.1',
     port: Number(process.env.IBKR_PORT ?? 4001),
     clientId: resolveIBKRClientId(),
+    // 行情类型：realtime 实时(1) / frozen 冻结(2) / delayed 延迟(3) / delayed-frozen 延迟冻结(4)
+    marketDataType: resolveIBKRMarketDataType(),
+    // 请求实时行情却被 IB 判定为未订阅（10167/354/10197）时，是否自动回退延迟行情（默认 true）
+    fallbackToDelayed: process.env.IBKR_FALLBACK_DELAYED !== 'false',
     // IBKR_DEBUG=true 时输出协议级 sent/received/result 日志，便于握手排障
     debug: process.env.IBKR_DEBUG === 'true'
   },

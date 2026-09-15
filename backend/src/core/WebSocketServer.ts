@@ -105,6 +105,19 @@ export function attachMarketSocket(server: Server, manager = new MarketManager()
               else send({ type: 'error', message: error?.message ? `[IBKR] 连接断开: ${error.message}` : '[IBKR] 连接断开，自动重连中...' })
             })
             if (unsubStatus) unsubs.push(unsubStatus)
+            // 0.1) 行情类型（1=实时 / 3=延迟）：订阅建立后立即回发当前值，之后变更继续推送，
+            //      前端据此在状态栏标注「实时行情 / 延迟行情（约 10 分钟）」
+            //      用 bind(adapter) 固化 this，避免解构后调用丢失上下文
+            const registerMarketDataType = adapter.onMarketDataType?.bind(adapter)
+            if (registerMarketDataType) {
+              const currentMarketDataType = adapter.getMarketDataType?.()
+              if (typeof currentMarketDataType === 'number') {
+                send({ type: 'marketdata', source: 'IBKR', symbol, interval, marketDataType: currentMarketDataType })
+              }
+              unsubs.push(registerMarketDataType((marketDataType) => {
+                send({ type: 'marketdata', source: 'IBKR', symbol, interval, marketDataType })
+              }))
+            }
             // 1) 逐笔 tick 流（reqContractDetails 解析合约 → reqMktData + reqTickByTickData）
             try {
               const unsubTick = await adapter.subscribeTick!(

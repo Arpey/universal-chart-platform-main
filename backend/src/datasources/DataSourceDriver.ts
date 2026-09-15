@@ -9,7 +9,7 @@ import { config, TRADEFI_SYMBOLS } from '../utils/config'
  * - binance / 未知 → BinanceFuturesAdapter（全量 USDT 永续，可被 HIDE_TRADEFI_IN_BINANCE 隐藏 tradefi 品种）
  * - tradefi         → BinanceFuturesAdapter(TRADEFI_SYMBOLS)（白名单过滤 + 越权拒绝）
  * - tradovate       → TradovateAdapter（需 TRADOVATE_* 配置，未配置时抛错）
- * - ibkr            → IBKRAdapter（需 IBKR_ENABLED=true，连接本地 IB Gateway / TWS 获取 CME 期货延迟行情）
+ * - ibkr            → IBKRAdapter（需 IBKR_ENABLED=true，连接本地 IB Gateway / TWS；行情类型见 IBKR_MARKET_DATA_TYPE）
  */
 export class DataSourceDriver {
   private static readonly cache = new Map<string, MarketDataAdapter>()

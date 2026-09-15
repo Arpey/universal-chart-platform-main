@@ -134,6 +134,11 @@ export interface IBKRConnectOptions {
   onKline?: (kline: Kline) => void
   /** IBKR 历史 K 线（后端 reqHistoricalData 一次性推送；分页时 append=true 表示更早数据，应合并而非替换）。 */
   onHist?: (klines: Kline[], append?: boolean) => void
+  /**
+   * 后端回报的本条订阅实际生效行情类型：1=实时 / 2=冻结 / 3=延迟（CME 约延迟 10 分钟）/ 4=延迟冻结。
+   * 用于状态栏标注「实时行情 / 延迟行情」，避免把延迟数据误判为断流。
+   */
+  onMarketDataType?: (marketDataType: number) => void
   onState?: (connected: boolean) => void
   onError?: (message: string) => void
 }
@@ -184,6 +189,7 @@ export function connectIBKR(opts: IBKRConnectOptions): IBKRConnection {
         size?: number
         timestamp?: number
         append?: boolean
+        marketDataType?: number
       }
       try {
         msg = JSON.parse(event.data as string) as typeof msg
@@ -213,6 +219,10 @@ export function connectIBKR(opts: IBKRConnectOptions): IBKRConnection {
           break
         case 'connected':
           opts.onState?.(true)
+          break
+        case 'marketdata':
+          // 行情类型（1=实时 / 3=延迟）：订阅建立后后端立即回发一次，变更时再推
+          if (typeof msg.marketDataType === 'number') opts.onMarketDataType?.(msg.marketDataType)
           break
         case 'unsubscribed':
           break

@@ -5,6 +5,7 @@ import { config } from './utils/config'
 import { MarketManager } from './core/MarketManager'
 import { attachMarketSocket } from './core/WebSocketServer'
 import type { Interval } from './types/kline'
+import type { IBKRAdapter } from './adapters/IBKRAdapter'
 
 const app = express()
 const server = createServer(app)
@@ -50,5 +51,17 @@ app.get('/api/datasources', (_req, res) => res.json({
   ],
 }))
 app.get('/api/health', (_req, res) => res.json({ status: 'ok' }))
+// IBKR diagnostics: shows the market data type actually in effect (1 = live, 3 = delayed),
+// the requested type, connection state, active subscriptions and last error.
+// First thing to check when "IBKR real-time quotes are not coming through".
+app.get('/api/ibkr/status', (_req, res) => {
+  if (!config.ibkr.enabled) { res.json({ enabled: false }); return }
+  try {
+    const adapter = manager.resolve('ibkr') as IBKRAdapter
+    res.json({ enabled: true, requested: config.ibkr.marketDataType, ...adapter.getStatus() })
+  } catch (error) {
+    res.status(502).json({ message: error instanceof Error ? error.message : 'IBKR status unavailable' })
+  }
+})
 attachMarketSocket(server, manager)
 server.listen(config.port, () => console.log(`API listening on http://localhost:${config.port}`))

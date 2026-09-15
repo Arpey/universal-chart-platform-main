@@ -10,6 +10,7 @@ import {
 } from '@stoqey/ib'
 import type { Contract, ContractDetails, TickType } from '@stoqey/ib'
 import { config } from '../utils/config'
+import type { IBKRMarketDataTypeSetting } from '../utils/config'
 import { logger } from '../utils/logger'
 import type { Interval, Kline } from '../types/kline'
 
@@ -32,6 +33,32 @@ export interface IBKRRealtimeBar {
   volume: number
 }
 
+/**
+ * IBKR 运行状态快照（GET /api/ibkr/status）。
+ * 「拿不到实时行情」时先看这里的 marketDataType：1=实时 / 3=延迟（约延迟 10 分钟）。
+ */
+export interface IBKRStatus {
+  host: string
+  port: number
+  clientId: number
+  connected: boolean
+  /** 配置请求的行情类型（1=实时 … 3=延迟） */
+  requestedMarketDataType: number
+  /** IB 实际返回的行情类型（1=实时 3=延迟）；尚未收到 IB 通知时为 null */
+  marketDataType: number | null
+  marketDataTypeLabel: string
+  /** 是否具备实时行情（收到延迟/冻结类型或「未订阅」错误后为 false） */
+  liveData: boolean
+  /** 当前活跃的行情订阅（合约代码） */
+  subscriptions: string[]
+  /** 各合约最近一次 tick 的接收时间（epoch ms） */
+  lastTicksAt: Record<string, number>
+  /** 最近一次 tick 的接收时间（epoch ms，0 表示本次连接尚无 tick） */
+  lastTickAt: number
+  /** 最近一次行情错误的原始文本（空串表示无） */
+  lastError: string
+}
+
 /** IBKR ErrorCode → 中文排查提示（关键握手错误码，控制台可直接定位问题）。 */
 const IBKR_ERROR_HINTS: Partial<Record<number, string>> = {
   [ErrorCode.CONNECT_FAIL]: '无法连接 TWS/IB Gateway：请确认「API 设置 → Enable ActiveX and Socket Clients」已勾选、Socket 端口与 IBKR_PORT 一致、IP 白名单包含 127.0.0.1',
@@ -43,9 +70,11 @@ const IBKR_ERROR_HINTS: Partial<Record<number, string>> = {
   [ErrorCode.UNKNOWN_CONTRACT]: '无法识别合约：请核对 Symbol/SecType/Exchange/Currency',
   [ErrorCode.ALREADY_CONNECTED]: '重复连接：请检查是否有其他客户端占用同一 clientId',
   [ErrorCode.PART_OF_REQUESTED_DATA_NOT_SUBSCRIBED]: '部分请求的行情未订阅',
-  [ErrorCode.DISPLAYING_DELAYED_DATA]: '显示延迟数据（未付费实时行情，属正常提示）',
+  [ErrorCode.DISPLAYING_DELAYED_DATA]: '显示延迟数据（未订阅该交易所实时行情，属提示；延迟数据 CME 约延迟 10 分钟）',
   [ErrorCode.FAIL_SEND_REQHISTDATA]: '历史数据请求发送失败（可能触发 IBKR 请求频率限制）',
   [ErrorCode.FAIL_SEND_REQRTBARS]: '实时 K 线请求发送失败',
+  10168: '请求的行情未订阅且无延迟行情：请核对行情订阅与合约参数',
+  10197: '与同一 IBKR 用户的另一实时会话冲突：请勿在本地 TWS 与服务器 IB Gateway 同时登录同一用户',
 }
 
 /** 各周期对应的 IBKR barSize（reqHistoricalData / reqRealTimeBars 共用）。 */
@@ -57,6 +86,37 @@ const HISTORICAL_BAR_SIZE: Record<Interval, BarSizeSetting> = {
   '4h': BarSizeSetting.HOURS_FOUR,
   '1d': BarSizeSetting.DAYS_ONE,
 }
+
+/** 配置字符串 → IB MarketDataType 数值（1=实时 2=冻结 3=延迟 4=延迟冻结）。 */
+const MARKET_DATA_TYPE_VALUES: Record<IBKRMarketDataTypeSetting, MarketDataType> = {
+  realtime: MarketDataType.REALTIME,
+  frozen: MarketDataType.FROZEN,
+  delayed: MarketDataType.DELAYED,
+  'delayed-frozen': MarketDataType.DELAYED_FROZEN,
+}
+
+/** MarketDataType 数值 → 中文名（日志 / 前端状态展示用）。 */
+const MARKET_DATA_TYPE_LABELS: Record<number, string> = {
+  1: '实时(Live)',
+  2: '冻结(Frozen)',
+  3: '延迟(Delayed，CME 约延迟 10 分钟)',
+  4: '延迟冻结(Delayed Frozen)',
+}
+
+/**
+ * 「实时行情不可用」错误码：收到后需停用仅实时可用的 reqTickByTickData / reqRealTimeBars，
+ * 并按配置回退延迟行情（否则会只拿到空数据或错误刷屏）。
+ * - 354：请求的行情未订阅（延迟行情也不可用）；
+ * - 10167：请求的行情未订阅，IB 改为推送延迟行情；
+ * - 10168：请求的行情未订阅且延迟行情不可用；
+ * - 10197：与同一用户的另一实时会话冲突（本地 TWS 与服务器 IB Gateway 同时登录同一用户）。
+ */
+const LIVE_DATA_UNAVAILABLE_CODES: number[] = [
+  ErrorCode.REQ_MKT_DATA_NOT_AVAIL,
+  ErrorCode.DISPLAYING_DELAYED_DATA,
+  10168,
+  10197,
+]
 
 /** 时区名（如 "US/Central"）→ 该时区相对 UTC 的偏移（毫秒，含 DST）。Intl 不支持时回退 0（按 UTC）。 */
 function timezoneOffsetMs(zone: string, epochMs: number): number {
@@ -104,6 +164,8 @@ function formatIBDateTime(epochMs: number): string {
 
 type TickListener = (tick: IBKRTick) => void
 type StatusListener = (connected: boolean, error?: Error) => void
+/** 行情类型变更回调（1=实时 2=冻结 3=延迟 4=延迟冻结）。 */
+type MarketDataTypeListener = (marketDataType: number) => void
 
 /**
  * CME 期货标的配置（单一数据源：搜索弹窗 get_symbols / /api/symbols 返回，与订阅契约共用）。
@@ -164,12 +226,15 @@ interface ContractPending {
 /**
  * IBKR（盈透证券）底层行情客户端：
  * - 连接本地 IB Gateway / TWS（默认端口 4001，可用 IBKR_PORT 覆盖），host 固定 127.0.0.1；
- * - 连接成功后立即请求延迟行情（MarketDataType.DELAYED = 3），未付费订阅也能免费获取测试数据；
- * - 每个合约同时发起 reqMktData + reqTickByTickData(AllLast) + reqRealTimeBars，
+ * - 连接成功后按 IBKR_MARKET_DATA_TYPE 请求行情类型：默认实时（REALTIME=1）；显式配 delayed 可强制免费延迟行情；
+ *   若账号/会话无实时权限（IB 返回 10167/354/10197），自动回退延迟行情（DELAYED=3）并停用仅实时可用的请求，
+ *   保证「没有实时权限也不会完全拿不到数据」；
+ * - 实时行情下每个合约同时发起 reqMktData + reqTickByTickData(AllLast) + reqRealTimeBars，
  *   监听 tickPrice / tickSize / tickByTickAllLast 合并为 { symbol, price, size, timestamp }，
  *   实时 K 线（realtimeBar）输出为 { symbol, time, open, high, low, close, volume }；
+ *   延迟行情下仅保留 reqMktData（延迟 tick），逐笔 / 实时 K 线会被 IB 拒绝，故不发；
  * - getHistoricalKlines 通过 reqHistoricalData 一次性拉取历史 K 线（带超时保护）；
- * - 断线指数退避自动重连，重连后重新设置延迟行情并恢复全部订阅。
+ * - 断线指数退避自动重连，重连后重新设置行情类型并恢复全部订阅。
  */
 export class IBKRClient {
   private ib: IBApi | null = null
@@ -182,6 +247,21 @@ export class IBKRClient {
   private connectionError = ''
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private reconnectAttempts = 0
+
+  // ---- 行情类型（实时 / 延迟）状态 ----
+  private readonly marketDataTypeListeners = new Set<MarketDataTypeListener>()
+  /** 配置请求的行情类型（构造时确定，见 config.ibkr.marketDataType） */
+  private readonly requestedMarketDataType: MarketDataType
+  /** IB 实际返回的行情类型（1=实时 3=延迟…）；尚未收到 IB 通知时为 null */
+  private marketDataType: number | null = null
+  /** 是否具备实时行情：门控仅实时可用的 reqTickByTickData / reqRealTimeBars */
+  private liveData: boolean
+  /** 是否已因「无实时权限」自动回退延迟行情（避免反复切换） */
+  private fallbackApplied = false
+  /** 最近一次行情错误的原始文本（诊断用） */
+  private lastError = ''
+  /** 最近一次 tick 的接收时间（诊断用） */
+  private lastTickAt = 0
 
   private readonly tickListeners = new Set<TickListener>()
   private readonly statusListeners = new Set<StatusListener>()
@@ -212,7 +292,10 @@ export class IBKRClient {
     this.host = config.ibkr.host
     this.port = config.ibkr.port
     this.clientId = config.ibkr.clientId
-    logger.info(`[IBKR] 客户端初始化: host=${this.host} port=${this.port} clientId=${this.clientId}${config.ibkr.debug ? '（IBKR_DEBUG=true，开启协议级日志）' : ''}`)
+    this.requestedMarketDataType = MARKET_DATA_TYPE_VALUES[config.ibkr.marketDataType]
+    // 先按配置乐观判断：只有实时类型才请求逐笔 / 5 秒实时 K 线；若 IB 回延迟通知或「未订阅」错误会自动停用
+    this.liveData = this.requestedMarketDataType === MarketDataType.REALTIME
+    logger.info(`[IBKR] 客户端初始化: host=${this.host} port=${this.port} clientId=${this.clientId} 配置行情类型=${config.ibkr.marketDataType}(${this.requestedMarketDataType})${config.ibkr.debug ? '（IBKR_DEBUG=true，开启协议级日志）' : ''}`)
   }
 
   // ---------- 公共 API ----------
@@ -242,6 +325,41 @@ export class IBKRClient {
   /** 最近一次合并输出的行情（REST getTicker 用）。 */
   getLast(symbol: string): IBKRTick | undefined {
     return this.lastTicks.get(symbol)
+  }
+
+  /** 注册行情类型变更回调（1=实时 2=冻结 3=延迟 4=延迟冻结），返回取消函数。 */
+  onMarketDataType(listener: MarketDataTypeListener): () => void {
+    this.marketDataTypeListeners.add(listener)
+    return () => this.marketDataTypeListeners.delete(listener)
+  }
+
+  /** 当前生效的行情类型（1=实时 3=延迟）；尚未收到 IB 通知时为 null。 */
+  getMarketDataType(): number | null {
+    return this.marketDataType
+  }
+
+  /**
+   * 运行状态快照（GET /api/ibkr/status）：
+   * 排查「IBKR 拿不到实时行情」时最先看 marketDataType —— 1=实时 / 3=延迟（CME 约延迟 10 分钟）。
+   */
+  getStatus(): IBKRStatus {
+    const marketDataType = this.marketDataType
+    return {
+      host: this.host,
+      port: this.port,
+      clientId: this.clientId,
+      connected: this.connected,
+      requestedMarketDataType: this.requestedMarketDataType,
+      marketDataType,
+      marketDataTypeLabel: marketDataType === null
+        ? '未知（尚未收到 IB 行情类型通知：连接未建立或尚未发起行情请求）'
+        : (MARKET_DATA_TYPE_LABELS[marketDataType] ?? String(marketDataType)),
+      liveData: this.liveData,
+      subscriptions: [...this.activeSubscriptions.values()].map((sub) => sub.symbol),
+      lastTicksAt: Object.fromEntries([...this.lastTicks.entries()].map(([symbol, tick]) => [symbol, tick.timestamp])),
+      lastTickAt: this.lastTickAt,
+      lastError: this.lastError,
+    }
   }
 
   /**
@@ -473,7 +591,7 @@ export class IBKRClient {
     ib.on(EventName.error, (err, code, reqId) => this.handleError(err, code, reqId))
     ib.on(EventName.info, (message, code) => this.handleInfo(message, code))
     ib.on(EventName.server, (version, connectionTime) => logger.info(`[IBKR] API Server 版本=${version}，连接时间=${connectionTime}`))
-    ib.on(EventName.marketDataType, (reqId, marketDataType) => logger.info(`[IBKR] 行情类型已切换(reqId=${reqId}) -> MarketDataType=${marketDataType}`))
+    ib.on(EventName.marketDataType, (reqId, marketDataType) => this.handleMarketDataType(reqId, marketDataType))
     ib.on(EventName.result, (eventName, args) => this.handleResult(eventName, args))
     // ---- 协议级日志（IBKR_DEBUG=true 时开启，否则不发） ----
     if (config.ibkr.debug) {
@@ -494,12 +612,17 @@ export class IBKRClient {
   private handleConnected(): void {
     this.connected = true
     this.connectionError = ''
+    this.lastError = ''
     this.reconnectAttempts = 0
     logger.info(`[IBKR] 已连接 ${this.host}:${this.port}（clientId=${this.clientId}）`)
-    // 立即启用延迟行情（3 号），未付费订阅也能获取免费测试数据。
+    // 按配置请求行情类型（默认 REALTIME=1；可用 IBKR_MARKET_DATA_TYPE=delayed 强制免费延迟行情）。
     // TWS 每次重连后都会重置行情类型，因此这里必须在每次连接成功后重新设置。
-    this.ib?.reqMarketDataType(MarketDataType.DELAYED)
-    // 恢复断线前全部订阅（tick-by-tick 在延迟行情下可能被拒，不影响 reqMktData 流）
+    this.fallbackApplied = false
+    this.marketDataType = null
+    this.liveData = this.requestedMarketDataType === MarketDataType.REALTIME
+    this.ib?.reqMarketDataType(this.requestedMarketDataType)
+    logger.info(`[IBKR] 已请求行情类型: ${MARKET_DATA_TYPE_LABELS[this.requestedMarketDataType] ?? this.requestedMarketDataType}（IB 会在 marketDataType 事件中回报本条订阅实际返回的类型）`)
+    // 恢复断线前全部订阅（逐笔 / 实时 K 线是否发起由 liveData 决定，延迟行情下自动跳过）
     for (const [reqId, sub] of this.activeSubscriptions.entries()) {
       this.requestMarketData(reqId, sub.symbol, sub.contract)
     }
@@ -508,6 +631,8 @@ export class IBKRClient {
 
   private handleDisconnected(): void {
     this.connected = false
+    // 连接断开后行情类型状态未知，重连成功时会重新请求（由 handleConnected 负责）
+    this.marketDataType = null
     this.lastPrice.clear()
     this.lastSize.clear()
     this.lastTs.clear()
@@ -536,6 +661,14 @@ export class IBKRClient {
     if (code === ErrorCode.FAIL_CONNECTION_LOST_BETWEEN_SERVER_AND_TWS || code === ErrorCode.CONNECTIVITY_RESTORED_DATA_LOST) {
       logger.warn(`[IBKR] 行情连接${code === ErrorCode.FAIL_CONNECTION_LOST_BETWEEN_SERVER_AND_TWS ? '中断' : '恢复'}${suffix}，重新订阅全部合约`)
       for (const [reqId, sub] of this.activeSubscriptions.entries()) this.requestMarketData(reqId, sub.symbol, sub.contract)
+      return
+    }
+    // 实时行情不可用（未订阅该交易所实时行情 / 与另一实时会话冲突）：IB 只会给延迟数据，
+    // 需停用仅实时可用的逐笔 / 实时 K 线，并按配置回退延迟行情，避免「只拿到空数据」。
+    if (LIVE_DATA_UNAVAILABLE_CODES.includes(code)) {
+      this.lastError = `${message}（ErrorCode=${code}${suffix}）`
+      logger.warn(`[IBKR] 实时行情不可用(reqId=${reqId}, ErrorCode=${code}${suffix}): ${message}`)
+      this.handleLiveDataUnavailable(code, message)
       return
     }
     // 连接层错误：reqId = -1（NO_VALID_ID）且尚未连接成功（如 ECONNREFUSED / CONNECT_FAIL=502）
@@ -619,15 +752,21 @@ export class IBKRClient {
   private requestMarketData(reqId: number, symbol: string, contract: Contract): void {
     const ib = this.ib
     if (!ib) return
-    // 实时行情流（snapshot=false, regulatorySnapshot=false）
+    // 实时行情流（snapshot=false, regulatorySnapshot=false）：实时 / 延迟行情均可用
     ib.reqMktData(reqId, contract, '', false, false)
-    // 逐笔成交流（延迟行情下可能返回不支持错误，不影响 tickPrice / tickSize 流）
+    // 逐笔（reqTickByTickData）与 5 秒实时 K 线（reqRealTimeBars）仅实时行情支持：
+    // 延迟行情下 IB 会直接拒绝（354/10167/10197），因此按 liveData 门控，避免无意义的错误刷屏。
+    if (!this.liveData) {
+      logger.info(`[IBKR] ${symbol} 当前为延迟行情，跳过 reqTickByTickData / reqRealTimeBars（仅实时行情支持）`)
+      return
+    }
+    // 逐笔成交流（实时行情下不可用时由 handleError 自动停用，不影响 tickPrice / tickSize 流）
     try {
       ib.reqTickByTickData(reqId, contract, TickByTickDataType.AllLast, 0, false)
     } catch (err) {
       logger.warn(`[IBKR] ${symbol} 请求 tick-by-tick 失败: ${err instanceof Error ? err.message : String(err)}`)
     }
-    // 实时 K 线流（barSize 参数当前被 TWS 忽略，固定 5 秒 bar；延迟行情下若被拒仅影响实时 K 线，不影响 tick 流）
+    // 实时 K 线流（barSize 参数当前被 TWS 忽略，固定 5 秒 bar；被拒仅影响实时 K 线，不影响 tick 流）
     try {
       ib.reqRealTimeBars(reqId, contract, 5, WhatToShow.TRADES, false)
       this.realTimeBarReqIds.add(reqId)
@@ -648,6 +787,80 @@ export class IBKRClient {
       try { this.ib.cancelTickByTickData(reqId) } catch { /* 取消失败可忽略 */ }
       if (this.realTimeBarReqIds.delete(reqId)) {
         try { this.ib.cancelRealTimeBars(reqId) } catch { /* 取消失败可忽略 */ }
+      }
+    }
+  }
+
+  /**
+   * IB 行情类型通知（marketDataType 事件）：事件值即本条订阅实际返回的数据类型（1=实时 3=延迟…）。
+   * - 收到非实时类型 → 说明该账号在此 IB Gateway 登录下没有实时行情权限（或配置了延迟行情），
+   *   此时必须停掉仅实时可用的 reqRealTimeBars / reqTickByTickData，否则会被 IB 反复拒绝；
+   * - 恢复实时类型（如订阅生效后重连）→ 重新补发上述实时专属请求。
+   */
+  private handleMarketDataType(reqId: number, marketDataType: number): void {
+    const changed = this.marketDataType !== marketDataType
+    this.marketDataType = marketDataType
+    const live = marketDataType === MarketDataType.REALTIME
+    const label = `${MARKET_DATA_TYPE_LABELS[marketDataType] ?? marketDataType}`
+    if (changed) {
+      logger.info(`[IBKR] 行情类型已切换(reqId=${reqId}) -> ${label}`)
+      // 仅在类型变化时通知监听方（WebSocketServer 据此广播给前端状态栏；
+      // 订阅建立时由 WS 主动回发当前值，无需重复推送）
+      this.emitMarketDataType(marketDataType)
+    } else {
+      logger.info(`[IBKR] 行情类型通知(reqId=${reqId}) -> ${label}`)
+    }
+    if (this.liveData === live) return
+    this.liveData = live
+    if (live) {
+      // 恢复实时行情：补发实时专属请求（reqTickByTickData / reqRealTimeBars）
+      for (const [id, sub] of this.activeSubscriptions.entries()) this.requestMarketData(id, sub.symbol, sub.contract)
+    } else {
+      this.cancelRealtimeOnlyRequests()
+    }
+  }
+
+  /** 广播行情类型给监听方（WebSocketServer → 前端状态栏「实时行情 / 延迟行情」）。 */
+  private emitMarketDataType(marketDataType: number): void {
+    for (const listener of this.marketDataTypeListeners) {
+      try { listener(marketDataType) } catch (err) { logger.error('[IBKR] 行情类型回调异常', err) }
+    }
+  }
+
+  /**
+   * 实时行情不可用（未订阅实时行情 / 与另一实时会话冲突）：
+   * 记录原因并在配置允许时回退延迟行情，保证「没有实时权限也能拿到（延迟）数据」。
+   */
+  private handleLiveDataUnavailable(code: number, message: string): void {
+    this.liveData = false
+    this.cancelRealtimeOnlyRequests()
+    if (this.fallbackApplied || !config.ibkr.fallbackToDelayed) {
+      logger.warn(`[IBKR] 实时行情不可用（ErrorCode=${code}）: ${message}。当前仅推送延迟行情（约延迟 10 分钟）。` +
+        '排查：Client Portal → Market Data Subscriptions 是否含 CME Globex 实时行情、状态是否 Active、是否绑定当前登录账号；新增订阅需重新登录 IB Gateway 才生效。')
+      return
+    }
+    if (this.requestedMarketDataType !== MarketDataType.REALTIME) return // 本身就配置为延迟行情，无需回退
+    this.fallbackApplied = true
+    this.marketDataType = MarketDataType.DELAYED
+    this.ib?.reqMarketDataType(MarketDataType.DELAYED)
+    this.emitMarketDataType(MarketDataType.DELAYED)
+    // 切换行情类型后重新提交订阅：此前按「实时」发起的请求可能已被 IB 拒绝，
+    // 重新 reqMktData 才会立刻开始推送延迟数据（此时 liveData=false，不会重发实时专属请求）
+    for (const [id, sub] of this.activeSubscriptions.entries()) this.requestMarketData(id, sub.symbol, sub.contract)
+    logger.warn(`[IBKR] 实时行情不可用（ErrorCode=${code}: ${message}），已自动回退延迟行情（CME 约延迟 10 分钟）。` +
+      '排查（按顺序）：1) Client Portal → Market Data Subscriptions 是否含 CME Globex（非专业）实时行情且状态 Active；' +
+      '2) 订阅是否绑定到 IB Gateway 当前登录的账号；3) 新增订阅后需重新登录 IB Gateway 才生效；' +
+      '4) 请勿在本地 TWS 与服务器 IB Gateway 同时登录同一 IBKR 用户（10197 会话冲突）。')
+  }
+
+  /** 取消仅实时行情可用的请求（reqTickByTickData / reqRealTimeBars），保留 reqMktData 主行情流。 */
+  private cancelRealtimeOnlyRequests(): void {
+    const ib = this.ib
+    if (!ib?.isConnected) return
+    for (const reqId of this.activeSubscriptions.keys()) {
+      try { ib.cancelTickByTickData(reqId) } catch { /* 取消失败可忽略 */ }
+      if (this.realTimeBarReqIds.delete(reqId)) {
+        try { ib.cancelRealTimeBars(reqId) } catch { /* 取消失败可忽略 */ }
       }
     }
   }
@@ -698,6 +911,7 @@ export class IBKRClient {
     const tick: IBKRTick = { symbol: sub.symbol, price, size, timestamp }
     this.lastEmit.set(reqId, tick)
     this.lastTicks.set(sub.symbol, tick)
+    this.lastTickAt = timestamp
     for (const listener of this.tickListeners) {
       try { listener(tick) } catch (err) { logger.error('[IBKR] Tick 回调异常', err) }
     }
