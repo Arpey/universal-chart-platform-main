@@ -1,6 +1,10 @@
 node_modules/
 dist/
+# 环境变量文件：只允许 .env.example 入库，其余本地 / 各环境专用文件一律忽略
+# （.env.prod 曾误入库，已从历史中清除；此处防止再次提交）
 .env
+.env.*
+!.env.example
 *.log
 .DS_Store
 # 临时/编译产物
