@@ -19,7 +19,8 @@ import type { OrderPreset } from './types/trading'
 
 const market = useMarketStore()
 const trading = useTradingStore()
-const lastTimeSec = computed(() => market.klines[market.klines.length - 1]?.time)
+/** 当前 K 线开盘时间（store 轻量信号）：仅「换线」时变化，避免每个 tick 重启倒计时定时器。 */
+const lastTimeSec = computed(() => (market.lastBarTime > 0 ? market.lastBarTime : undefined))
 const { countdown: candleCountdown, targetClock: nextCandleOpenClock } = useCountdown(computed(() => market.interval), lastTimeSec)
 const connected = ref(false)
 const searchOpen = ref(false)
@@ -283,6 +284,7 @@ function openQuickOrder(preset: OrderPreset) {
         <TradingChart
           v-if="market.view === 'candlestick'"
           :data="market.klines"
+          :update-signal="market.klineVersion"
           :interval="market.interval"
           :symbol="market.symbol"
           :datasource="market.datasource"
@@ -313,7 +315,7 @@ function openQuickOrder(preset: OrderPreset) {
     <!-- 下单面板：默认折叠，点击顶栏“下单”按钮以右侧抽屉展开 -->
     <TradingPanel />
 
-    <StatusBar :connected="connected" :count="market.klines.length" :datasource="currentSourceLabel" :view="market.view" :interval="market.interval" :last-data-at="market.lastDataAt" :market-data-type="market.ibkrMarketDataType" />
+    <StatusBar :connected="connected" :count="market.barCount" :datasource="currentSourceLabel" :view="market.view" :interval="market.interval" :last-data-at="market.lastDataAt" :market-data-type="market.ibkrMarketDataType" />
     <SymbolSearchModal v-model:open="searchOpen" />
     <IndicatorsModal :open="indicatorModalOpen" @close="indicatorModalOpen = false" />
   </main>

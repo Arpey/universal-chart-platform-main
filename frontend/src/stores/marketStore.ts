@@ -1,7 +1,8 @@
 import { defineStore } from 'pinia'
-import { computed, ref } from 'vue'
+import { computed, ref, shallowRef } from 'vue'
 import type { DataSource, Dom, Interval, Kline, MarketView, Quote, Source, SymbolInfo, Ticker, TradeTick } from '../types'
 import { fetchMarket, fetchSymbols, fetchTickers } from '../services/chartService'
+import { normalizeKline, normalizeKlines } from '../utils/klineSeries'
 
 const DEFAULT_SYMBOL: Record<DataSource, string> = { binance: 'BTCUSDT', tradovate: 'NQ', tradefi: 'XAUUSDT', ibkr: 'MES' }
 
@@ -10,7 +11,21 @@ export const useMarketStore = defineStore('market', () => {
   /** 当前分类：全部合约 / Tradefi（与 datasource 保持同步，tradovate 不在分类内）。 */
   const currentSource = ref<Source>('ibkr')
   const view = ref<MarketView>('candlestick')
-  const symbol = ref(DEFAULT_SYMBOL.ibkr); const interval = ref<Interval>('1m'); const klines = ref<Kline[]>([]); const ticker = ref<Ticker>(); const loading = ref(false); const error = ref('')
+  const symbol = ref(DEFAULT_SYMBOL.ibkr); const interval = ref<Interval>('1m'); const ticker = ref<Ticker>(); const loading = ref(false); const error = ref('')
+  /** K 线最大保留根数（超出裁掉最旧一根）。 */
+  const MAX_BARS = 500
+  /**
+   * K 线数组：shallowRef + 纯 JS 对象（刻意 **不** 放进 Vue 深度响应式）。
+   * 实时 tick 只对「最后一根」原地更新 —— 不新建数组、不触发深度遍历/深比较，
+   * 消费方（图表等）通过 klineVersion / lastBarTime / barCount 这些轻量信号即时感知变化。
+   */
+  const klines = shallowRef<Kline[]>([])
+  /** tick 级变更信号：每次成功写入 K 线自增，图表据此在 **同一任务内** 调用 series.update()（无节流）。 */
+  const klineVersion = ref(0)
+  /** 当前（未收盘）K 线的开盘时间（10 位 Unix 秒）：仅跨周期换线时变化，供倒计时 / 分页使用。 */
+  const lastBarTime = ref(0)
+  /** K 线根数：仅在结构性变化（新增 / 整表替换 / 裁掉最旧）时更新，避免每 tick 触发列表重建。 */
+  const barCount = ref(0)
   const symbols = ref<SymbolInfo[]>([]); const tickers = ref<Ticker[]>([]); const universeLoading = ref(false); const universeError = ref('')
   // Tradovate 实时流：报价 / 盘口 / 逐笔
   const quote = ref<Quote>()
@@ -29,9 +44,21 @@ export const useMarketStore = defineStore('market', () => {
     loading.value = true; error.value = ''
     try {
       const result = await fetchMarket(symbol.value, interval.value, datasource.value)
-      klines.value = result.klines
+      setKlines(result.klines)
       ticker.value = result.ticker
     } catch (e) { error.value = e instanceof Error ? e.message : '加载失败' } finally { loading.value = false }
+  }
+
+  /**
+   * 结构性写入（历史快照 / 分页 / 加载 / 清空）：整表替换并同步轻量信号。
+   * 归一化保证 10 位 Unix 秒 + 严格升序（图表 setData 要求），属于低频操作、非 tick 热路径。
+   */
+  function setKlines(next: readonly Kline[]) {
+    const bars = normalizeKlines(next)
+    klines.value = bars
+    barCount.value = bars.length
+    lastBarTime.value = bars.length ? bars[bars.length - 1].time : 0
+    klineVersion.value++ // 通知图表：结构变化 → 全量重绘一次
   }
 
   /** 拉取交易对列表 + 24h 行情快照（供搜索列表展示）。任一失败都清空该侧并记录错误。 */
@@ -80,7 +107,7 @@ export const useMarketStore = defineStore('market', () => {
     else if (next === 'binance') currentSource.value = 'binance'
     symbol.value = DEFAULT_SYMBOL[next]
     // 数据源切换后清空全部跨源数据，避免残留上一数据源的列表/行情
-    klines.value = []
+    setKlines([])
     ticker.value = undefined
     quote.value = undefined
     dom.value = undefined
@@ -127,7 +154,7 @@ export const useMarketStore = defineStore('market', () => {
    * 避免新数据到达前图表 / 顶栏价格 / 倒计时锚点继续沿用旧标的坐标与数值。
    */
   function clearMarketData() {
-    klines.value = []
+    setKlines([])
     ticker.value = undefined
     quote.value = undefined
     dom.value = undefined
@@ -136,32 +163,54 @@ export const useMarketStore = defineStore('market', () => {
     ibkrMarketDataType.value = null
   }
 
+  /**
+   * 单根实时 K 线（后端 Tick 合成的当前周期 K 线）。
+   *
+   * - 归一化：毫秒 → 10 位 Unix 秒、数值兜底、high/low 与 open/close 自洽；
+   * - 防乱序：时间早于最后一根的迟到数据直接丢弃，否则 lightweight-charts 的 `update()`
+   *   会因时间回退抛错（Cannot update oldest data）并让图表停止刷新；
+   * - 同周期（time 相同）：整根替换 —— 后端已按 high=max / low=min / close=最新 / volume 累加合成；
+   * - 跨入新周期（time 更大）：追加一根全新 K 线。
+   */
   function update(kline: Kline) {
-    if (!kline || typeof kline.time !== 'number') return
+    const next = normalizeKline(kline)
+    if (!next) return
+    const bars = klines.value
+    const last = bars.length ? bars[bars.length - 1] : null
+    // 防乱序：早于最后一根的迟到数据直接丢弃（不刷新「最近收到行情」时间戳）
+    if (last && next.time < last.time) return
+    if (last && next.time === last.time) {
+      // 同周期：原地更新最后一根（零数组分配；图表随后拿到全新的 Bar 对象覆盖当前蜡烛）
+      last.open = next.open
+      last.high = next.high
+      last.low = next.low
+      last.close = next.close
+      last.volume = next.volume
+    } else {
+      // 跨入新周期：尾部追加全新 K 线（next.time 严格大于上一根，换线不锁不卡）
+      bars.push(next)
+      lastBarTime.value = next.time
+      if (bars.length > MAX_BARS) bars.shift()
+      barCount.value = bars.length
+    }
     lastDataAt.value = Date.now()
-    const last = klines.value.at(-1)
-    if (last?.time === kline.time) klines.value[klines.value.length - 1] = kline
-    else klines.value.push(kline)
-    if (klines.value.length > 500) klines.value.shift()
-    if (ticker.value) ticker.value = { ...ticker.value, price: kline.close, updatedAt: Date.now() }
+    // 唯一增量信号：图表 watcher(flush:'sync') 在同一任务内立即 series.update()（无 rAF / 无节流）
+    klineVersion.value++
+    // 价格变化才重建 ticker 对象，避免每 tick 产生无意义的响应式写入
+    if (ticker.value && ticker.value.price !== next.close) {
+      ticker.value = { ...ticker.value, price: next.close, updatedAt: Date.now() }
+    }
   }
 
   /**
    * 全量历史批量（append=false 整表替换；append=true 追加更早分页数据）。
-   * 无论哪种模式都按 time 去重 + 升序，保证 setData 的有序性。
+   * 统一经 setKlines：毫秒/秒归一化为 10 位 Unix 秒、过滤非法行、按 time 去重升序，
+   * 保证 `setData()` 的有序性（混排单位会导致排序错乱、历史被当成最新数据）。
    */
   function applyHist(rows: Kline[], append = false) {
     if (!Array.isArray(rows)) return
     lastDataAt.value = Date.now()
-    const seen = new Map<number, Kline>()
-    const source = append ? klines.value : []
-    for (const k of source) {
-      if (k && typeof k.time === 'number' && Number.isFinite(k.time)) seen.set(k.time, k)
-    }
-    for (const k of rows) {
-      if (k && typeof k.time === 'number' && Number.isFinite(k.time)) seen.set(k.time, k)
-    }
-    klines.value = [...seen.values()].sort((a, b) => a.time - b.time)
+    setKlines(append ? [...klines.value, ...rows] : rows)
     const last = klines.value.at(-1)
     if (last && ticker.value) ticker.value = { ...ticker.value, price: last.close, updatedAt: Date.now() }
   }
@@ -207,6 +256,7 @@ export const useMarketStore = defineStore('market', () => {
 
   return {
     datasource, currentSource, availableSources, view, symbol, interval, klines, ticker, loading, error,
+    klineVersion, lastBarTime, barCount,
     symbols, tickers, universeLoading, universeError,
     quote, dom, trades, domConnected, lastDataAt, ibkrMarketDataType,
     load, loadUniverse, setDatasource, switchSource, setView, setSymbol,

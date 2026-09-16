@@ -131,13 +131,22 @@ export function attachMarketSocket(server: Server, manager = new MarketManager()
               for (const unsub of unsubs) unsub()
               return
             }
-            // 2) 实时 K 线流（reqRealTimeBars → { symbol, time, open, high, low, close, volume }）
+            // 2) 历史 K 线快照（reqHistoricalData 一次性全量，内置超时；失败仅报错不影响实时流）
+            //    先于实时流推送：其最后一根同时作为实时聚合器的播种数据（同周期续接而非覆盖）
+            const history = adapter.getKlines(symbol, interval, 300)
+            void history
+              .then((rows) => {
+                if (client.readyState === client.OPEN) send({ type: 'hist', source: 'IBKR', symbol, interval, append: false, data: rows })
+              })
+              .catch((err) => send({ type: 'error', message: err instanceof Error ? err.message : 'IBKR 历史K线加载失败' }))
+            // 3) 实时 K 线流：5 秒实时 bar / 逐笔 tick → 聚合为 interval 周期 K 线（Unix 秒、按周期向下取整对齐）
             try {
               const unsubBar = await adapter.subscribeBar!(
                 symbol,
                 interval,
                 (kline) => send({ type: 'kline', source: 'IBKR', symbol, interval, data: kline }),
                 (message) => send({ type: 'error', message }),
+                history.then((rows) => rows[rows.length - 1]).catch(() => undefined),
               )
               unsubs.push(unsubBar)
             } catch (err) {
@@ -145,12 +154,6 @@ export function attachMarketSocket(server: Server, manager = new MarketManager()
               for (const unsub of unsubs) unsub()
               return
             }
-            // 3) 历史 K 线快照（reqHistoricalData 一次性全量，内置超时；失败仅报错不影响实时流）
-            void adapter.getKlines(symbol, interval, 300)
-              .then((rows) => {
-                if (client.readyState === client.OPEN) send({ type: 'hist', source: 'IBKR', symbol, interval, append: false, data: rows })
-              })
-              .catch((err) => send({ type: 'error', message: err instanceof Error ? err.message : 'IBKR 历史K线加载失败' }))
             ibkrSubscriptions.set(symbol, () => { for (const unsub of unsubs) unsub() })
             send({ type: 'connected', source: 'IBKR', symbol, interval, dataType: 'tick' })
           })

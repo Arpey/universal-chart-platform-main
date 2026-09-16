@@ -1,4 +1,4 @@
-import type { Interval, Kline } from './kline'
+import type { Interval, Kline, KlineSeed } from './kline'
 import type { DomData, QuoteData, Ticker, TickerMessage, TradeData } from './market'
 
 /** 交易对/合约基本信息（前端搜索列表用） */
@@ -36,8 +36,13 @@ export interface MarketAdapter {
   subscribeDOM?(symbol: string, onDom: (data: DomData) => void, onError?: (message: string) => void): () => void
   /** 逐笔成交流（可选，IBKR 需先解析合约故为异步） */
   subscribeTick?(symbol: string, onTick: (data: TradeData | TickerMessage) => void, onError?: (message: string) => void): (() => void) | Promise<() => void>
-  /** 实时 K 线流（可选，IBKR reqRealTimeBars → { symbol, time, open, high, low, close, volume }） */
-  subscribeBar?(symbol: string, interval: Interval, onKline: (kline: Kline) => void, onError?: (message: string) => void): (() => void) | Promise<() => void>
+  /**
+   * 实时 K 线流（可选，IBKR reqRealTimeBars → { symbol, time, open, high, low, close, volume }）。
+   * 实现方负责把上游数据（5 秒实时 bar / 逐笔）聚合为 `interval` 周期的 K 线：
+   * 时间戳统一为 10 位 Unix 秒并按周期向下取整对齐。
+   * @param seed 历史最后一根 K 线（可为异步 Promise）：与实时首根同周期时续接而非覆盖。
+   */
+  subscribeBar?(symbol: string, interval: Interval, onKline: (kline: Kline) => void, onError?: (message: string) => void, seed?: KlineSeed): (() => void) | Promise<() => void>
 }
 
 /** 支持交易对/合约列表与批量行情的适配器（当前两个数据源均实现） */

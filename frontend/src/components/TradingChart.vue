@@ -25,6 +25,7 @@ import { useCountdown } from '../composables/useCountdown'
 import { useIndicatorStore } from '../stores/indicatorStore'
 import { useTradingStore } from '../stores/tradingStore'
 import { calculateEMA } from '../utils/indicators'
+import { normalizeKlines, toKlineSeconds } from '../utils/klineSeries'
 import { formatBeijingDateTime, formatBeijingShort, timeLikeToEpochSec } from '../utils/beijingTime'
 import { POINT_COUNT, randomColor, DEFAULT_FIB_LEVELS, type DrawKind, type DrawObject, type DrawPoint } from '../types/drawing'
 import type { Interval } from '../types'
@@ -72,6 +73,12 @@ interface Kline {
 const props = defineProps<{
   data: Kline[]
   interval: Interval
+  /**
+   * 实时变更信号（store.klineVersion）：每次 K 线写入自增。
+   * watcher 使用 flush:'sync'，因此在 props 更新（紧随 store 写入的那次 patch）中立即执行
+   * series.update() —— 不经过 rAF / setTimeout / debounce，也不会像 rAF 那样丢弃中间 tick。
+   */
+  updateSignal?: number
   /** 当前标的（如 BTCUSDT / NQ / MES）：用于识别跨标的切换并触发完整图表重置 */
   symbol?: string
   /** 当前数据源（binance / tradovate / ibkr / tradefi） */
@@ -119,15 +126,32 @@ let crosshairHandler: ((param: any) => void) | null = null
 // ---------- 技术指标（EMA） ----------
 const indicator = useIndicatorStore()
 const emaSeriesMap = new Map<string, ISeriesApi<'Line'>>()
+/** EMA 尾部缓存（每个实例一条）：用于 tick 级增量递推，避免每个 tick 全量重算整条 EMA。 */
+interface EmaTail {
+  /** 已渲染的最后一个 EMA 点时间（10 位 Unix 秒） */
+  time: number
+  /** 已渲染的最后一个 EMA 值 */
+  value: number
+  /** 倒数第二个 EMA 值（EMA[i-1]，同周期 tick 重算末点用） */
+  prev: number | null
+}
+const emaTailMap = new Map<string, EmaTail>()
 const emaLastValues = ref<Record<string, number | null>>({})
 const emaSettingsId = ref<string | null>(null)
 const emaSettingsObj = computed(() => indicator.emaInstances.find((e) => e.id === emaSettingsId.value) ?? null)
 
 const drawings = ref<DrawObject[]>([])
-let raf = 0
-let renderPending = false
+/**
+ * 增量渲染重入锁：同步执行、无论成功失败都在 finally 中释放 ——
+ * 杜绝「更新中」标志未释放导致图表永远卡住（原实现的 renderPending 在异常路径上会残留）。
+ */
+let updating = false
+/** 更新期间又到达的新 tick：本次结束后补刷一次（最多一层递归，不会无限循环）。 */
+let tickPending = false
 let lastLen = 0
 let lastFirstTime = 0
+/** 已渲染的最后一根 K 线时间（10 位 Unix 秒）：用于判断 update() 的时间是否回退。 */
+let lastRenderedTime = 0
 let disposed = false
 let ro: ResizeObserver | null = null
 let loadMoreGuardTime = 0 // 已触发 load_more 的最旧 bar 时间（避免同一边界重复请求）
@@ -139,14 +163,29 @@ let prevScopeDatasource = props.datasource ?? ''
 let pendingAutoFit = true
 
 // ---------- K 线收盘倒计时 ----------
-const lastTimeSec = computed(() => props.data[props.data.length - 1]?.time)
-const lastClose = computed(() => props.data[props.data.length - 1]?.close ?? 0)
+/**
+ * 当前（未收盘）K 线的收盘价。
+ * 直接读数组尾部（props.data 为浅响应数组，实时值由 updateSignal 驱动刷新），
+ * 不做响应式依赖追踪 —— 保证每次调用都拿到最新 tick 值。
+ */
+function currentClose(): number {
+  const bars = props.data
+  return bars.length ? toNumber(bars[bars.length - 1].close) : 0
+}
+
+/**
+ * 当前 K 线开盘时间：额外依赖 updateSignal，使 tick 级原地更新后仍能重算；
+ * computed 的值只在「换线」时变化 → useCountdown 的定时器不会每个 tick 被重启。
+ */
+const lastTimeSec = computed(() => {
+  void props.updateSignal
+  return props.data[props.data.length - 1]?.time
+})
 const { countdown } = useCountdown(computed(() => props.interval), lastTimeSec)
 
-watch([countdown, lastClose], () => {
-  if (countdownPrimitive) {
-    countdownPrimitive.setValue(lastClose.value, countdown.value)
-  }
+// 倒计时每秒重算：同步刷新徽标上的最新价（tick 级刷新由 applyRealtimeTick 直接负责）
+watch(countdown, () => {
+  countdownPrimitive?.setValue(currentClose(), countdown.value)
 })
 
 // ---------- 图表持仓线（TradingView 风格：方向 / 均价 / 数量 / 实时盈亏 / TP·SL） ----------
@@ -192,7 +231,7 @@ function syncPositionOverlay() {
     return
   }
   const dir = pos.side === 'BUY' ? 1 : -1
-  const last = lastClose.value > 0 ? lastClose.value : pos.markPrice
+  const last = currentClose()
   const mark = Number.isFinite(last) && last > 0 ? last : pos.markPrice
   const pnl = (mark - pos.entryPrice) * pos.qty * dir
   const cost = pos.entryPrice * pos.qty
@@ -220,11 +259,11 @@ function syncPositionOverlay() {
   positionPrimitive.setState(state)
 }
 
-// 行情价格 / 持仓 / bracket / 拖拽草稿任一变化 → 实时刷新持仓线叠加层
+// 持仓 / bracket / 拖拽草稿任一变化 → 刷新持仓线叠加层
+// （行情价格变化不走这里：每个 tick 由 applyRealtimeTick 直接调用，避免 deep 遍历大盘数组）
 watch(
   () => [
     props.symbol,
-    props.data,
     trading.positions,
     () => trading.positionBrackets[(props.symbol ?? '').toUpperCase()],
     draftSl,
@@ -345,15 +384,14 @@ onMounted(async () => {
   // K 线收盘倒计时徽标（叠加层）
   countdownPrimitive = new CandleCountdownPrimitive()
   candleSeries.attachPrimitive(countdownPrimitive)
-  countdownPrimitive.setValue(lastClose.value, countdown.value)
+  countdownPrimitive.setValue(currentClose(), countdown.value)
 
   // 图表持仓线叠加层（TradingView 风格：方向/均价/数量/实时盈亏 + TP·SL 拖拽手柄）
   positionPrimitive = new PositionLinePrimitive()
   candleSeries.attachPrimitive(positionPrimitive)
   syncPositionOverlay()
 
-  applyData(props.data, true)
-  lastLen = props.data.length
+  fullRefresh()
 
   // 滚动到最左侧已加载 K 线时触发分页加载更早历史（IBKR）
   chart.timeScale().subscribeVisibleLogicalRangeChange(onVisibleLogicalRangeChange)
@@ -373,7 +411,6 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   disposed = true
-  if (raf) cancelAnimationFrame(raf)
   window.removeEventListener('resize', handleResize)
   ro?.disconnect()
   // 清理 EMA 折线系列（chart.removeSeries 为 v5 的移除 API）
@@ -404,25 +441,88 @@ function handleResize() {
   }
 }
 
-// ---------- 数据更新（tick 级增量） ----------
-function applyData(data: Kline[], force: boolean) {
-  if (!candleSeries || !volumeSeries) return
-  const bars = normalizeKlines(data) // 先归一化（去重/排序/过滤非法）
-  const firstTime = bars.length ? bars[0].time : 0
-  if (force || bars.length !== lastLen || firstTime !== lastFirstTime) {
-    candleSeries.setData(bars.map(toCandle))
-    volumeSeries.setData(bars.map(toVolume))
-    lastLen = bars.length
-    lastFirstTime = firstTime
-    // 切换标的/周期/首次加载后：新数据就绪即自适应时间轴与价格轴
-    if (pendingAutoFit && bars.length > 0) {
-      pendingAutoFit = false
-      autoFitChart()
+// ---------- 数据更新：结构级全量重绘 + tick 级增量（无节流） ----------
+
+/**
+ * 全量重绘（低频、结构级）：历史整表替换 / 分页加载 / 清空 / 切标的 / 时间回退时调用。
+ * 这里是**唯一**的 `setData()` 调用点 —— 实时 tick 路径绝不触发它，避免每 tick 深拷贝整表。
+ */
+function fullRefresh() {
+  if (disposed || !candleSeries || !volumeSeries) return
+  const bars = normalizeKlines(props.data)
+  candleSeries.setData(bars.map(toCandle))
+  volumeSeries.setData(bars.map(toVolume))
+  lastLen = props.data.length
+  lastFirstTime = props.data.length ? toKlineSeconds(props.data[0].time) : 0
+  lastRenderedTime = props.data.length ? toKlineSeconds(props.data[props.data.length - 1].time) : 0
+  // 画线叠加层持有 K 线数组元素引用：结构变化后重新绑定（tick 原地更新无需重绑）
+  primitive?.setKlines(props.data)
+  primitive?.setObjects(drawings.value, selectedId.value)
+  if (pendingAutoFit && bars.length > 0) {
+    pendingAutoFit = false
+    autoFitChart()
+  }
+  syncEmaSeries()
+}
+
+/**
+ * 实时增量刷新（tick 级，**无节流**）。
+ *
+ * 由 `props.updateSignal`（store.klineVersion）以 `flush: 'sync'` 触发：store 写入后紧随的
+ * patch 中立即执行，不经过 requestAnimationFrame / setTimeout / debounce（原实现用 rAF 节流，
+ * 既引入最多一帧延迟，又会在 renderPending 期间丢弃中间 tick）。
+ *
+ * - 同周期 tick：只把「最后一根」交给 `series.update()`（覆盖当前蜡烛），零数组分配；
+ * - 换线（尾部新增一根）：同样只调 `series.update()`，由 lightweight-charts 追加新 K 线，
+ *   不做 setData、不复制整个 K 线数组；
+ * - 结构变化 / 时间回退：回退 `fullRefresh()` 自愈（保证 update() 的时间严格递增）；
+ * - 重入由 `updating` 串行化，锁在 finally 中释放（异常也不会把图表锁死）；
+ *   更新期间到达的 tick 用 `tickPending` 标记，结束后补刷一次（最多一层，不会无限递归）。
+ */
+function applyRealtimeTick() {
+  if (disposed || !candleSeries || !volumeSeries) return
+  if (updating) { tickPending = true; return }
+  updating = true
+  try {
+    const bars = props.data
+    const len = bars.length
+    if (!len) return
+    const first = toKlineSeconds(bars[0].time)
+    // 结构变化（整表替换 / 裁掉最旧 / 一次补多根）→ 全量重绘
+    if (len < lastLen || len > lastLen + 1 || first !== lastFirstTime) {
+      fullRefresh()
+      return
     }
-  } else if (bars.length > 0) {
-    const last = bars[bars.length - 1]
+    const last = bars[len - 1]
+    const time = toKlineSeconds(last.time)
+    // 时间回退（乱序 / 迟到数据）→ 全量重绘兜底：update() 收到更早时间会抛错并让渲染停摆
+    if (time < lastRenderedTime) {
+      fullRefresh()
+      return
+    }
     candleSeries.update(toCandle(last))
     volumeSeries.update(toVolume(last))
+    lastLen = len
+    lastFirstTime = first
+    lastRenderedTime = time
+    // 叠加层随 tick 轻量同步：倒计时徽标最新价 / 持仓浮盈 / EMA 折线尾部
+    countdownPrimitive?.setValue(toNumber(last.close), countdown.value)
+    syncPositionOverlay()
+    syncEmaTail(last)
+  } catch (err) {
+    // 任何异常都不得卡住渲染：降级为全量重绘
+    console.warn('[TradingChart] 实时增量渲染失败，回退全量重绘', err)
+    try {
+      fullRefresh()
+    } catch (fallbackErr) {
+      console.error('[TradingChart] 全量重绘仍失败', fallbackErr)
+    }
+  } finally {
+    updating = false
+    if (tickPending) {
+      tickPending = false
+      applyRealtimeTick()
+    }
   }
 }
 
@@ -437,11 +537,13 @@ function resetChartContext(clearDrawings: boolean) {
   volumeSeries.setData([])
   lastLen = 0
   lastFirstTime = 0
+  lastRenderedTime = 0
   // 2) 分页守卫归零，避免新标的沿用旧标的的 load_more 去重边界
   loadMoreGuardTime = 0
   loadMoreGuardAt = 0
   // 3) EMA：旧标的数值失效，先清空渲染，待新数据经 syncEmaSeries 重算
   for (const s of emaSeriesMap.values()) s.setData([])
+  emaTailMap.clear()
   emaLastValues.value = {}
   // 4) 价格轴恢复自动缩放（用户对旧标的手动拖动/缩放不带到新标的）
   chart.priceScale('right').applyOptions({ autoScale: true })
@@ -452,7 +554,7 @@ function resetChartContext(clearDrawings: boolean) {
   if (clearDrawings) drawings.value = []
   primitive?.setKlines([])
   primitive?.setObjects(drawings.value, selectedId.value)
-  // 6) 标记等待新数据 → applyData 全量写入后自动 fitContent
+  // 6) 标记等待新数据 → fullRefresh() 全量写入后自动 fitContent
   pendingAutoFit = true
 }
 
@@ -464,19 +566,9 @@ function autoFitChart() {
   chart.priceScale('volume').applyOptions({ autoScale: true })
 }
 
-/** 归一化原始 K 线：过滤非法行 → 同 time 去重 → 按 time 升序（满足 setData 的严格有序要求） */
-function normalizeKlines(data: Kline[]): Kline[] {
-  const seen = new Map<number, Kline>()
-  for (const k of data) {
-    if (!k || typeof k.time !== 'number' || !Number.isFinite(k.time)) continue
-    seen.set(k.time, k)
-  }
-  return [...seen.values()].sort((a, b) => a.time - b.time)
-}
-
-/** 时间戳适配：>= 1e12 视为毫秒（如币安原始 openTime）→ 除以 1000 转秒；否则视为秒直接使用 */
+/** 时间戳适配：统一为 10 位 Unix 秒（lightweight-charts 不允许毫秒），>= 1e12 视为毫秒 */
 function toUTCTime(t: number): UTCTimestamp {
-  return (t >= 1e12 ? Math.floor(t / 1000) : Math.floor(t)) as UTCTimestamp
+  return toKlineSeconds(t) as UTCTimestamp
 }
 
 /**
@@ -547,15 +639,57 @@ function syncEmaSeries() {
     }
     s.applyOptions({ color: inst.color, lineWidth: inst.lineWidth as LineWidth, visible: inst.visible })
     s.setData(points.map((p) => ({ time: toUTCTime(p.time), value: p.value } as LineData)))
+    // 记录尾部两点：tick 增量递推需要 EMA[i-1]（prev）与当前末点（value）
+    const count = points.length
+    if (count > 0) {
+      emaTailMap.set(inst.id, {
+        time: toKlineSeconds(points[count - 1].time),
+        value: points[count - 1].value,
+        prev: count >= 2 ? points[count - 2].value : null,
+      })
+    } else {
+      emaTailMap.delete(inst.id)
+    }
   }
   // 清理已删除实例对应的折线系列
   for (const [id, s] of [...emaSeriesMap.entries()]) {
     if (!desired.has(id)) {
       chart.removeSeries(s)
       emaSeriesMap.delete(id)
+      emaTailMap.delete(id)
       const next = { ...emaLastValues.value }
       delete next[id]
       emaLastValues.value = next
+    }
+  }
+}
+
+/**
+ * tick 级增量更新 EMA 尾部（O(1)）：EMA_today = Close·k + EMA_yesterday·(1-k)。
+ * - 同周期 tick：用 `tail.prev` 重算末点并 `series.update()`；
+ * - 换线（时间更大）：以 `tail.value` 为前值追加新点，EMA 折线随换线即时延伸。
+ * （原实现每 tick 全量重算整条 EMA：500 根 × N 个指标，是刷新频率的主要瓶颈。）
+ */
+function syncEmaTail(bar: Kline) {
+  if (!emaTailMap.size || !emaSeriesMap.size) return
+  const time = toKlineSeconds(bar.time)
+  const close = toNumber(bar.close)
+  if (!time || !(close > 0)) return
+  for (const inst of indicator.emaInstances) {
+    const series = emaSeriesMap.get(inst.id)
+    const tail = emaTailMap.get(inst.id)
+    if (!series || !tail) continue
+    const k = 2 / (inst.length + 1)
+    if (time === tail.time) {
+      const value = tail.prev == null ? close : close * k + tail.prev * (1 - k)
+      series.update({ time: time as UTCTimestamp, value })
+      tail.value = value
+      emaLastValues.value[inst.id] = value
+    } else if (time > tail.time) {
+      const value = close * k + tail.value * (1 - k)
+      series.update({ time: time as UTCTimestamp, value })
+      emaTailMap.set(inst.id, { time, value, prev: tail.value })
+      emaLastValues.value[inst.id] = value
     }
   }
 }
@@ -567,32 +701,37 @@ function fmtEmaValue(v: number | null | undefined): string {
     : v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 }
 
+// 指标实例变化（增删 / 改色 / 改长度）→ 重算 EMA（deep 仅覆盖指标实例数组，不涉及 K 线大盘数组）
 watch(
-  [() => props.data, () => indicator.emaInstances],
-  () => syncEmaSeries(),
+  () => indicator.emaInstances,
+  () => { if (!disposed) syncEmaSeries() },
   { deep: true },
 )
 
-// rAF 节流处理频繁 tick（每 tick 只增量刷新最后一根）
+/**
+ * 结构性 K 线变化（历史整表替换 / 分页 / 清空）：数组引用变化即触发。
+ * 刻意**不加 deep** —— 实时 tick 只原地更新最后一根、不改变数组引用，因此不会进入这里（走 updateSignal 增量路径）。
+ */
 watch(
   () => props.data,
-  (nv, ov) => {
+  () => {
     if (disposed) return
-    if (nv !== ov) {
-      // 切换标的/周期：清空未完成绘制状态与选区
-      cancelPending()
-      deselect()
-    }
-    primitive?.setKlines(nv)
-    if (renderPending) return
-    renderPending = true
-    raf = requestAnimationFrame(() => {
-      renderPending = false
-      applyData(props.data, false)
-      primitive?.setObjects(drawings.value, selectedId.value)
-    })
+    // 切换标的 / 周期 / 历史整表替换：清空未完成绘制状态与选区
+    cancelPending()
+    deselect()
+    fullRefresh()
   },
-  { deep: true },
+)
+
+/**
+ * 实时 tick 信号（store.klineVersion）：`flush: 'sync'` 让回调在信号变化的同一次 patch 中执行，
+ * 即 store.update() → series.update() 之间不存在 rAF / setTimeout / debounce 延迟，
+ * 也不会像 rAF 节流那样在“渲染中”丢弃后续 tick（中途到达的 tick 由 tickPending 补刷）。
+ */
+watch(
+  () => props.updateSignal,
+  () => applyRealtimeTick(),
+  { flush: 'sync' },
 )
 
 // 标的 / 数据源 / 周期变化 → 完整重置图表（Series、坐标轴、分页守卫、指标与画线状态）
