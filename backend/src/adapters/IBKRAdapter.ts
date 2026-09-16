@@ -10,15 +10,10 @@ import { logger } from '../utils/logger'
 
 /**
  * 实时 K 线合成的上游数据源：
- * - `bar`：权威 5 秒实时 bar（reqRealTimeBars，实时行情下可用）；
- * - `tick`：逐笔 tick 合成（延迟行情下拿不到 5 秒 bar 时的兜底，否则 K 线无法实时推进）。
+ * - `tick`：reqMktData / reqTickByTickData 的逐笔 tick 经 KlineAggregator 聚合（当前唯一启用路径，刷新粒度跟随 tick）；
+ * - `bar`：上游 bar 粒度源（已停用，保留类型以便后续接入其它 bar 粒度数据源时复用）。
  */
 type KlineFeed = 'bar' | 'tick'
-
-/** 订阅后多久收不到实时 bar 就退化为逐笔合成（3 根 5 秒 bar 的余量）。 */
-const BAR_FEED_TIMEOUT_MS = 15_000
-/** 退化看门狗轮询间隔。 */
-const BAR_FEED_WATCH_INTERVAL_MS = 3_000
 
 /**
  * IBKR（盈透证券）数据源适配器。
@@ -26,8 +21,8 @@ const BAR_FEED_WATCH_INTERVAL_MS = 3_000
  * 内部管理 IBKRClient 实例，将 IBKR 的行情统一转换为项目通用格式：
  * - tickPrice / tickSize / tickByTickAllLast → { type: 'ticker', source: 'IBKR', symbol, price, size, timestamp }
  * - reqHistoricalData 历史 K 线 → Kline[]（Unix 秒；REST / WS 全量快照）
- * - reqRealTimeBars 5 秒实时 bar / 逐笔 tick → 经 KlineAggregator 合成 interval 周期的 K 线
- *   （Unix 秒、按周期向下取整对齐，WS 增量广播）
+ * - reqMktData / reqTickByTickData 的逐笔 tick → 经 KlineAggregator 合成 interval 周期的 K 线
+ *   （Unix 秒、按周期向下取整对齐，WS 增量广播；不再依赖上游 5 秒 bar 接口）
  *
  * 通过 subscribeTick / subscribeBar 注册的回调实时输出（供 WebSocketServer 广播给前端）。
  * 行情类型（实时 / 延迟）由 backend/.env 的 IBKR_MARKET_DATA_TYPE 控制（默认实时），
@@ -135,15 +130,18 @@ export class IBKRAdapter extends BaseAdapter implements MarketDataAdapter {
   }
 
   /**
-   * 订阅实时 K 线，并把上游数据 **聚合为当前订阅周期** 的 K 线后回调（WebSocketServer）。
+   * 订阅实时 K 线：上游 **只用逐笔 tick**（reqMktData / reqTickByTickData），
+   * 经 KlineAggregator 聚合为当前订阅周期 的 K 线后回调（WebSocketServer）。
    *
-   * 上游可能是两种粒度，两者都会先经 KlineAggregator 归一化：
-   * - 权威 5 秒实时 bar（reqRealTimeBars，实时行情下唯一可用，`barSize` 参数被 TWS 忽略）；
-   * - 逐笔 tick（reqMktData / reqTickByTickData）：延迟行情拿不到 5 秒 bar 时退化为逐笔合成。
+   * IBKR 的 5 秒实时 bar 接口已停用 —— 其粒度固定 5 秒且受 TWS「10 分钟最多 60 次新请求」的
+   * pacing 限制，无法满足 250ms 级实时刷新。逐笔来源：
+   * - 实时行情：reqTickByTickData(AllLast) 提供真实逐笔成交；
+   * - 延迟行情：reqTickByTickData 被 IB 拒绝，但 reqMktData 的 tickPrice / tickSize 仍在推送 →
+   *   由 IBKRClient 合并后同样通过 onTick 输出。
+   * 两条路径都落在同一个 onTick 上，K 线刷新粒度因此完全跟随 tick（有 tick 即推进当前 K 线）。
    *
    * 聚合保证：毫秒时间戳 → 10 位 Unix 秒、按 interval 向下取整对齐、同周期 high=max / low=min /
    * close=最新 / volume 累加、跨周期开新根、迟到数据丢弃。
-   * 两种数据源不会同时累加成交量：切回权威 bar 时会清空逐笔合成的未完成 K 线。
    *
    * @param seed 历史最后一根 K 线（可为异步 Promise）：与实时首根同周期时续接而非覆盖，
    *             否则该周期的 open 与前半段 volume 会缺失。
@@ -158,7 +156,7 @@ export class IBKRAdapter extends BaseAdapter implements MarketDataAdapter {
     let disposed = false
     let unsubscribeClient: (() => void) | null = null
     try {
-      // 内部先解析真实近月合约，再 reqMktData + reqRealTimeBars（TWS 固定 5 秒 bar）
+      // 内部先解析真实近月合约，再 reqMktData（实时行情下另发 reqTickByTickData）
       unsubscribeClient = await this.client.subscribeMarketData(symbol)
     } catch (err) {
       onError?.(err instanceof Error ? err.message : String(err))
@@ -166,10 +164,8 @@ export class IBKRAdapter extends BaseAdapter implements MarketDataAdapter {
     }
 
     const aggregator = new KlineAggregator(interval)
-    // 已知当前拿不到实时行情（延迟 / 冻结）时直接走逐笔合成，避免白白等 15s 看门狗
-    const marketDataType = this.client.getMarketDataType()
-    let feed: KlineFeed = marketDataType != null && marketDataType !== 1 ? 'tick' : 'bar'
-    let lastBarAt = Date.now()
+    // 上游数据源恒为逐笔 tick：不再根据 marketDataType 分流到 5 秒 bar 通路
+    let feed: KlineFeed = 'tick'
 
     // 消费方（WebSocketServer 广播）异常不得反向影响上游 tick 循环与聚合状态机
     const emit = (kline: Kline | null) => {
@@ -188,59 +184,17 @@ export class IBKRAdapter extends BaseAdapter implements MarketDataAdapter {
         .catch(() => { /* 历史不可用：仅影响首根 K 线的 open / volume 完整性 */ })
     }
 
-    const unsubscribeBar = this.client.onRealtimeBar((bar) => {
-      if (disposed || bar.symbol !== symbol) return
-      if (feed !== 'bar') {
-        // 逐笔合成 → 权威 5 秒 bar：丢弃逐笔合成的未完成 K 线，避免 OHLCV 重复累加
-        aggregator.reset()
-        feed = 'bar'
-      }
-      lastBarAt = Date.now()
-      emit(aggregator.pushBar({
-        time: bar.time,
-        open: bar.open,
-        high: bar.high,
-        low: bar.low,
-        close: bar.close,
-        volume: bar.volume,
-      }))
-    })
-
+    // 逐笔 → K 线聚合：每来一个 tick 即推进当前 K 线（同周期高/低/收/量更新，跨周期开新根）。
+    // 聚合器内部完成「毫秒 → 10 位 Unix 秒 + 按周期向下取整对齐 + 乱序/迟到丢弃」，
+    // 因此前端收到 kline 后可立即 series.update()，刷新粒度跟随 tick（无 5 秒 bar 的粒度上限）。
     const unsubscribeTick = this.client.onTick((tick) => {
-      // 仅在权威 bar 不可用时用逐笔合成，避免与 5 秒 bar 的成交量重复累加。
-      // 注意：逐笔时间戳为 IBKRClient 的接收时刻（毫秒），因此延迟行情下合成 K 线按「接收时刻」
-      // 落桶 —— 延迟体现在价格上，而非把 K 线放到 10 分钟前的时间轴上。
       if (disposed || feed !== 'tick' || tick.symbol !== symbol) return
       emit(aggregator.push({ price: tick.price, size: tick.size, timestamp: tick.timestamp }))
     })
 
-    // 看门狗：长时间收不到实时 bar（reqRealTimeBars 被跳过 / 被拒）→ 退化为逐笔合成，保证 K 线仍在推进。
-    // 使用「一次性延时 + 按需重排」而非常驻 setInterval：每条订阅不再常驻定时器，且不会在
-    // 已退化 / 已销毁后继续唤醒（避免定时器泄漏与状态被反复重置）。
-    let watchdog: ReturnType<typeof setTimeout> | null = null
-    const armWatchdog = () => {
-      if (disposed || feed === 'tick' || watchdog) return
-      watchdog = setTimeout(() => {
-        watchdog = null
-        if (disposed || feed === 'tick') return
-        if (Date.now() - lastBarAt < BAR_FEED_TIMEOUT_MS) {
-          armWatchdog() // 仍能收到 bar → 继续等待下一次检查
-          return
-        }
-        feed = 'tick'
-        aggregator.reset()
-        logger.info(`[IBKR] ${symbol} ${interval} 已 ${BAR_FEED_TIMEOUT_MS / 1000}s 未收到实时 bar，退化为逐笔合成 K 线`)
-      }, BAR_FEED_WATCH_INTERVAL_MS)
-    }
-    armWatchdog()
-
+    // 取消订阅：只清理 tick 监听 + 上游行情订阅（5 秒 bar 通路已移除，无任何定时器/看门狗残留）
     return () => {
       disposed = true
-      if (watchdog) {
-        clearTimeout(watchdog)
-        watchdog = null
-      }
-      unsubscribeBar()
       unsubscribeTick()
       unsubscribeClient?.()
     }

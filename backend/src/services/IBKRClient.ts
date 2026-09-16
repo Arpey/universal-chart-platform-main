@@ -22,17 +22,6 @@ export interface IBKRTick {
   timestamp: number
 }
 
-/** IBKR 实时 K 线（reqRealTimeBars，TWS 固定 5 秒 bar）输出格式 */
-export interface IBKRRealtimeBar {
-  symbol: string
-  time: number
-  open: number
-  high: number
-  low: number
-  close: number
-  volume: number
-}
-
 /**
  * IBKR 运行状态快照（GET /api/ibkr/status）。
  * 「拿不到实时行情」时先看这里的 marketDataType：1=实时 / 3=延迟（约延迟 10 分钟）。
@@ -77,7 +66,7 @@ const IBKR_ERROR_HINTS: Partial<Record<number, string>> = {
   10197: '与同一 IBKR 用户的另一实时会话冲突：请勿在本地 TWS 与服务器 IB Gateway 同时登录同一用户',
 }
 
-/** 各周期对应的 IBKR barSize（reqHistoricalData / reqRealTimeBars 共用）。 */
+/** 各周期对应的 IBKR barSize（reqHistoricalData 用；实时 K 线改为逐笔 tick 聚合，不再使用上游 bar 周期）。 */
 const HISTORICAL_BAR_SIZE: Record<Interval, BarSizeSetting> = {
   '1m': BarSizeSetting.MINUTES_ONE,
   '5m': BarSizeSetting.MINUTES_FIVE,
@@ -104,7 +93,7 @@ const MARKET_DATA_TYPE_LABELS: Record<number, string> = {
 }
 
 /**
- * 「实时行情不可用」错误码：收到后需停用仅实时可用的 reqTickByTickData / reqRealTimeBars，
+ * 「实时行情不可用」错误码：收到后需停用仅实时可用的 reqTickByTickData，
  * 并按配置回退延迟行情（否则会只拿到空数据或错误刷屏）。
  * - 354：请求的行情未订阅（延迟行情也不可用）；
  * - 10167：请求的行情未订阅，IB 改为推送延迟行情；
@@ -229,10 +218,10 @@ interface ContractPending {
  * - 连接成功后按 IBKR_MARKET_DATA_TYPE 请求行情类型：默认实时（REALTIME=1）；显式配 delayed 可强制免费延迟行情；
  *   若账号/会话无实时权限（IB 返回 10167/354/10197），自动回退延迟行情（DELAYED=3）并停用仅实时可用的请求，
  *   保证「没有实时权限也不会完全拿不到数据」；
- * - 实时行情下每个合约同时发起 reqMktData + reqTickByTickData(AllLast) + reqRealTimeBars，
+ * - 实时行情下每个合约发起 reqMktData + reqTickByTickData(AllLast)，
  *   监听 tickPrice / tickSize / tickByTickAllLast 合并为 { symbol, price, size, timestamp }，
- *   实时 K 线（realtimeBar）输出为 { symbol, time, open, high, low, close, volume }；
- *   延迟行情下仅保留 reqMktData（延迟 tick），逐笔 / 实时 K 线会被 IB 拒绝，故不发；
+ *   实时 K 线由上层（IBKRAdapter + KlineAggregator）用这些 tick 聚合得到（250ms 级刷新）；
+ *   延迟行情下仅保留 reqMktData（延迟 tick），逐笔会被 IB 拒绝，故不发；
  * - getHistoricalKlines 通过 reqHistoricalData 一次性拉取历史 K 线（带超时保护）；
  * - 断线指数退避自动重连，重连后重新设置行情类型并恢复全部订阅。
  */
@@ -254,7 +243,7 @@ export class IBKRClient {
   private readonly requestedMarketDataType: MarketDataType
   /** IB 实际返回的行情类型（1=实时 3=延迟…）；尚未收到 IB 通知时为 null */
   private marketDataType: number | null = null
-  /** 是否具备实时行情：门控仅实时可用的 reqTickByTickData / reqRealTimeBars */
+  /** 是否具备实时行情：门控仅实时可用的 reqTickByTickData */
   private liveData: boolean
   /** 是否已因「无实时权限」自动回退延迟行情（避免反复切换） */
   private fallbackApplied = false
@@ -278,9 +267,10 @@ export class IBKRClient {
   private readonly lastEmit = new Map<number, IBKRTick>()
   private readonly lastTicks = new Map<string, IBKRTick>()
 
-  // 实时 K 线（reqRealTimeBars）与历史 K 线（reqHistoricalData）支持
-  private readonly barListeners = new Set<(bar: IBKRRealtimeBar) => void>()
-  private readonly realTimeBarReqIds = new Set<number>()
+  // 历史 K 线（reqHistoricalData）支持
+  // 注：IBKR 的 5 秒实时 bar 请求已停用 —— 该接口粒度固定为 5 秒且受 TWS
+  // 「10 分钟最多 60 次新请求」的 pacing 限制，无法满足 250ms 级实时 K 线刷新；
+  // 实时 K 线统一由 reqMktData / reqTickByTickData 的逐笔 tick 聚合产生（见 IBKRAdapter）。
   private readonly historicalPending = new Map<number, HistoricalPending>()
 
   // 合约解析缓存（reqContractDetails 解析出的真实近月合约）
@@ -310,12 +300,6 @@ export class IBKRClient {
   onStatus(listener: StatusListener): () => void {
     this.statusListeners.add(listener)
     return () => this.statusListeners.delete(listener)
-  }
-
-  /** 注册实时 K 线回调（reqRealTimeBars → { symbol, time, open, high, low, close, volume }），返回取消函数。 */
-  onRealtimeBar(listener: (bar: IBKRRealtimeBar) => void): () => void {
-    this.barListeners.add(listener)
-    return () => this.barListeners.delete(listener)
   }
 
   isConnected(): boolean {
@@ -505,9 +489,9 @@ export class IBKRClient {
   }
 
   /**
-   * 订阅指定合约的实时行情（先解析真实近月合约，再 reqMktData / reqTickByTickData / reqRealTimeBars）。
+   * 订阅指定合约的实时行情（先解析真实近月合约，再 reqMktData / reqTickByTickData）。
    * 同一合约重复订阅共享底层数据流（引用计数管理）。
-   * @returns 取消订阅函数；最后一个订阅取消时自动 cancelMktData / cancelTickByTickData / cancelRealTimeBars。
+   * @returns 取消订阅函数；最后一个订阅取消时自动 cancelMktData / cancelTickByTickData。
    */
   async subscribeMarketData(symbol: string): Promise<() => void> {
     if (!CONTRACTS[symbol]) throw new Error(`不支持的 IBKR 合约: ${symbol}（支持 ${IBKR_SYMBOLS.join('/')}）`)
@@ -598,11 +582,10 @@ export class IBKRClient {
       ib.on(EventName.received, (tokens) => logger.debug(`[IBKR] <== 收到: ${JSON.stringify(tokens)}`))
       ib.on(EventName.sent, (tokens) => logger.debug(`[IBKR] ==> 发送: ${JSON.stringify(tokens)}`))
     }
-    // ---- 行情 / K 线事件 ----
+    // ---- 行情 / K 线事件（实时 K 线不再订阅上游 5 秒 bar，改由逐笔 tick 聚合） ----
     ib.on(EventName.tickPrice, (reqId, field, value) => this.handleTickPrice(reqId, field, value))
     ib.on(EventName.tickSize, (reqId, field, value) => this.handleTickSize(reqId, field, value))
     ib.on(EventName.tickByTickAllLast, (reqId, _tickType, _time, price, size) => this.handleTickByTickAllLast(reqId, price, size))
-    ib.on(EventName.realtimeBar, (reqId, time, open, high, low, close, volume) => this.handleRealtimeBar(reqId, time, open, high, low, close, volume))
     ib.on(EventName.historicalData, (reqId, date, open, high, low, close, volume) => this.handleHistoricalData(reqId, date, open, high, low, close, volume))
     ib.on(EventName.contractDetails, (reqId, contractDetails) => this.handleContractDetails(reqId, contractDetails))
     ib.on(EventName.contractDetailsEnd, (reqId) => this.handleContractDetailsEnd(reqId))
@@ -700,22 +683,6 @@ export class IBKRClient {
     if (config.ibkr.debug) logger.debug(`[IBKR] result: ${eventName} ${JSON.stringify(args ?? [])}`)
   }
 
-  /** reqRealTimeBars（固定 5 秒 bar）→ { symbol, time, open, high, low, close, volume } 广播给订阅者。 */
-  private handleRealtimeBar(reqId: number, time: number, open: number, high: number, low: number, close: number, volume: number): void {
-    const sub = this.activeSubscriptions.get(reqId)
-    if (!sub) return
-    if (typeof close !== 'number' || !Number.isFinite(close) || close <= 0) return
-    const bar: IBKRRealtimeBar = {
-      symbol: sub.symbol,
-      time: typeof time === 'number' && Number.isFinite(time) && time > 0 ? time * 1000 : Date.now(),
-      open, high, low, close,
-      volume: typeof volume === 'number' && Number.isFinite(volume) && volume > 0 ? volume : 0,
-    }
-    for (const listener of this.barListeners) {
-      try { listener(bar) } catch (err) { logger.error('[IBKR] RealtimeBar 回调异常', err) }
-    }
-  }
-
   /** reqContractDetails 回调：收集匹配的合约描述。 */
   private handleContractDetails(reqId: number, contractDetails: ContractDetails): void {
     const pending = this.contractPending.get(reqId)
@@ -754,10 +721,10 @@ export class IBKRClient {
     if (!ib) return
     // 实时行情流（snapshot=false, regulatorySnapshot=false）：实时 / 延迟行情均可用
     ib.reqMktData(reqId, contract, '', false, false)
-    // 逐笔（reqTickByTickData）与 5 秒实时 K 线（reqRealTimeBars）仅实时行情支持：
-    // 延迟行情下 IB 会直接拒绝（354/10167/10197），因此按 liveData 门控，避免无意义的错误刷屏。
+    // 逐笔（reqTickByTickData）仅实时行情支持：延迟行情下 IB 会直接拒绝（354/10167/10197），
+    // 因此按 liveData 门控，避免无意义的错误刷屏；延迟行情下仍有 reqMktData 的 tickPrice / tickSize 可用。
     if (!this.liveData) {
-      logger.info(`[IBKR] ${symbol} 当前为延迟行情，跳过 reqTickByTickData / reqRealTimeBars（仅实时行情支持）`)
+      logger.info(`[IBKR] ${symbol} 当前为延迟行情，跳过 reqTickByTickData（仅实时行情支持，K 线改由 tickPrice/tickSize 聚合）`)
       return
     }
     // 逐笔成交流（实时行情下不可用时由 handleError 自动停用，不影响 tickPrice / tickSize 流）
@@ -765,13 +732,6 @@ export class IBKRClient {
       ib.reqTickByTickData(reqId, contract, TickByTickDataType.AllLast, 0, false)
     } catch (err) {
       logger.warn(`[IBKR] ${symbol} 请求 tick-by-tick 失败: ${err instanceof Error ? err.message : String(err)}`)
-    }
-    // 实时 K 线流（barSize 参数当前被 TWS 忽略，固定 5 秒 bar；被拒仅影响实时 K 线，不影响 tick 流）
-    try {
-      ib.reqRealTimeBars(reqId, contract, 5, WhatToShow.TRADES, false)
-      this.realTimeBarReqIds.add(reqId)
-    } catch (err) {
-      logger.warn(`[IBKR] ${symbol} 请求实时K线失败: ${err instanceof Error ? err.message : String(err)}`)
     }
   }
 
@@ -785,16 +745,13 @@ export class IBKRClient {
     if (this.ib?.isConnected) {
       try { this.ib.cancelMktData(reqId) } catch { /* 取消失败可忽略 */ }
       try { this.ib.cancelTickByTickData(reqId) } catch { /* 取消失败可忽略 */ }
-      if (this.realTimeBarReqIds.delete(reqId)) {
-        try { this.ib.cancelRealTimeBars(reqId) } catch { /* 取消失败可忽略 */ }
-      }
     }
   }
 
   /**
    * IB 行情类型通知（marketDataType 事件）：事件值即本条订阅实际返回的数据类型（1=实时 3=延迟…）。
    * - 收到非实时类型 → 说明该账号在此 IB Gateway 登录下没有实时行情权限（或配置了延迟行情），
-   *   此时必须停掉仅实时可用的 reqRealTimeBars / reqTickByTickData，否则会被 IB 反复拒绝；
+   *   此时必须停掉仅实时可用的 reqTickByTickData，否则会被 IB 反复拒绝；
    * - 恢复实时类型（如订阅生效后重连）→ 重新补发上述实时专属请求。
    */
   private handleMarketDataType(reqId: number, marketDataType: number): void {
@@ -813,7 +770,7 @@ export class IBKRClient {
     if (this.liveData === live) return
     this.liveData = live
     if (live) {
-      // 恢复实时行情：补发实时专属请求（reqTickByTickData / reqRealTimeBars）
+      // 恢复实时行情：补发实时专属请求（reqTickByTickData）
       for (const [id, sub] of this.activeSubscriptions.entries()) this.requestMarketData(id, sub.symbol, sub.contract)
     } else {
       this.cancelRealtimeOnlyRequests()
@@ -853,15 +810,12 @@ export class IBKRClient {
       '4) 请勿在本地 TWS 与服务器 IB Gateway 同时登录同一 IBKR 用户（10197 会话冲突）。')
   }
 
-  /** 取消仅实时行情可用的请求（reqTickByTickData / reqRealTimeBars），保留 reqMktData 主行情流。 */
+  /** 取消仅实时行情可用的请求（reqTickByTickData），保留 reqMktData 主行情流（延迟行情的 K 线来源）。 */
   private cancelRealtimeOnlyRequests(): void {
     const ib = this.ib
     if (!ib?.isConnected) return
     for (const reqId of this.activeSubscriptions.keys()) {
       try { ib.cancelTickByTickData(reqId) } catch { /* 取消失败可忽略 */ }
-      if (this.realTimeBarReqIds.delete(reqId)) {
-        try { ib.cancelRealTimeBars(reqId) } catch { /* 取消失败可忽略 */ }
-      }
     }
   }
 
