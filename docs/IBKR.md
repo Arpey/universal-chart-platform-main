@@ -13,9 +13,20 @@ IBKR_PORT=4001
 IBKR_MARKET_DATA_TYPE=realtime
 # 请求实时行情但无权限（IB 回 10167/354/10197）时是否自动回退延迟行情，默认 true
 # IBKR_FALLBACK_DELAYED=false
-# IBKR_CLIENT_ID=42        # 不配则随机 1..1000，避免 Error 326（客户号码已被占用）
+# clientId：后端只维护**一条**全局 IBKR 连接（IBKRClient 单例），固定使用该编号并一直复用。
+# 不配置时默认 1；请勿使用随机编号 —— 每次重启随机换号会让 TWS/IB Gateway 的
+# 「API clients」列表不断新增条目（即「TWS 里出现大量客户端连接」）。若默认 1 已被占用（Error 326），
+# 在这里换一个未被占用的编号即可。
+# IBKR_CLIENT_ID=42
+# 断开后的最小重连间隔（毫秒，默认 30000）：给 TWS/IB Gateway 释放旧 clientId 的时间窗
+# IBKR_RECONNECT_DELAY_MS=30000
 # IBKR_DEBUG=true          # 输出协议级 sent/received/result 日志
 ```
+
+- 后端**全进程只有一个 IBKRClient 实例**（`getIBKRClient()` 单例，构造函数私有），所有行情订阅、
+  历史 K 线、状态查询都复用同一条到 TWS / IB Gateway 的连接；`connect()` 幂等（已连接 / 连接中 / 重连窗口内
+  一律跳过），`disconnect()` 会置空并释放底层 socket。想减少 TWS 里看到的客户端数量，
+  应在 TWS 的 API 客户端列表中确认只剩后端的这一个 clientId。
 
 - `IBKR_HOST` 必须是 **后端进程所在机器** 上运行 IB Gateway/TWS 的地址。后端部署在云服务器时，
   IB Gateway 也必须装在并登录在那台服务器上（`127.0.0.1` 指向服务器自身，不是你的本地电脑）。

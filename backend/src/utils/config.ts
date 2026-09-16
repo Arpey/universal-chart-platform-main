@@ -7,11 +7,18 @@ const nodeEnv = process.env.NODE_ENV ?? 'development'
 loadDotEnv({ override: true })
 loadDotFile({ path: `${__dirname}/../../config/${nodeEnv}.env`, override: false })
 
+/** IBKR 默认 clientId：后端只维护一条全局连接（IBKRClient 单例），固定编号即可稳定复用同一个 TWS 客户端槽位。 */
+const DEFAULT_IBKR_CLIENT_ID = 1
+
 /**
  * 解析 IBKR clientId：
  * - 显式配置了正整数（如 IBKR_CLIENT_ID=42）→ 尊重显式配置；
- * - 未配置 / 0 / 非法值 → 随机 1..1000。TWS/IB Gateway 每个 clientId 只允许一个 API 连接，
- *   固定 ID（尤其 0 或 10）极易与其他客户端/旧进程冲突，被 Error 326（客户号码已被使用）拒连。
+ * - 未配置 / 0 / 非法值 → 固定使用 DEFAULT_IBKR_CLIENT_ID（1）。
+ *
+ * 注意：不要每次启动随机生成 clientId —— 整个 backend 只建立一条 IBKR 连接（IBKRClient 单例），
+ * 随机 ID 会让 TWS / IB Gateway 的 API 客户端列表在每次重启后多出一条记录，
+ * 表现为「TWS 里出现大量客户端连接」。若默认 1 与其它程序冲突（Error/InfoCode 326），
+ * 显式设置 IBKR_CLIENT_ID 换一个未被占用的编号即可。
  */
 function resolveIBKRClientId(): number {
   const raw = process.env.IBKR_CLIENT_ID
@@ -19,7 +26,18 @@ function resolveIBKRClientId(): number {
     const parsed = Number(raw)
     if (Number.isInteger(parsed) && parsed > 0) return parsed
   }
-  return Math.floor(Math.random() * 1000) + 1
+  return DEFAULT_IBKR_CLIENT_ID
+}
+
+/**
+ * 解析 IBKR 断开后的最小重连间隔（毫秒，IBKR_RECONNECT_DELAY_MS）：
+ * TWS / IB Gateway 释放旧 clientId 需要时间，过快重连会被登记成新的 API 客户端，
+ * 因此默认 30s（下限 1s，避免误配成 0 造成快速重连）。
+ */
+function resolveIBKRReconnectDelay(): number {
+  const parsed = Number(process.env.IBKR_RECONNECT_DELAY_MS ?? 30_000)
+  if (!Number.isFinite(parsed) || parsed < 1_000) return 30_000
+  return Math.floor(parsed)
 }
 
 /** IBKR 行情类型（MarketDataType）：realtime=实时(1) / frozen=冻结(2) / delayed=延迟(3) / delayed-frozen=延迟冻结(4)。 */
@@ -78,6 +96,9 @@ export const config = {
     host: process.env.IBKR_HOST ?? '127.0.0.1',
     port: Number(process.env.IBKR_PORT ?? 4001),
     clientId: resolveIBKRClientId(),
+    // 全局唯一连接断开后的最小重连间隔（毫秒，默认 30s）：给 TWS/IB Gateway 释放旧 clientId 的时间窗，
+    // 过快重连会被登记成新的 API 客户端，导致 TWS 客户端列表不断增长
+    reconnectDelayMs: resolveIBKRReconnectDelay(),
     // 行情类型：realtime 实时(1) / frozen 冻结(2) / delayed 延迟(3) / delayed-frozen 延迟冻结(4)
     marketDataType: resolveIBKRMarketDataType(),
     // 请求实时行情却被 IB 判定为未订阅（10167/354/10197）时，是否自动回退延迟行情（默认 true）

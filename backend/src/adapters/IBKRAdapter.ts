@@ -1,6 +1,6 @@
 import { BaseAdapter } from './BaseAdapter'
-import { IBKRClient, IBKR_CME_SYMBOLS } from '../services/IBKRClient'
-import type { IBKRStatus } from '../services/IBKRClient'
+import { getIBKRClient, IBKR_CME_SYMBOLS } from '../services/IBKRClient'
+import type { IBKRClient, IBKRStatus } from '../services/IBKRClient'
 import { KlineAggregator, toEpochMs, toEpochSeconds } from '../core/KlineAggregator'
 import type { MarketDataAdapter, SymbolInfo } from '../types/adapter'
 import type { Interval, Kline, KlineSeed } from '../types/kline'
@@ -18,7 +18,10 @@ type KlineFeed = 'bar' | 'tick'
 /**
  * IBKR（盈透证券）数据源适配器。
  *
- * 内部管理 IBKRClient 实例，将 IBKR 的行情统一转换为项目通用格式：
+ * 复用**全局唯一**的 IBKRClient 实例（getIBKRClient 单例）：本适配器只做协议转换
+ * （tick → TickerMessage、历史 / 实时 tick → Kline），不会创建第二个连接 ——
+ * 所有 subscribeTick / subscribeBar / getKlines 都落在同一条到 TWS / IB Gateway 的连接上。
+ * 将 IBKR 的行情统一转换为项目通用格式：
  * - tickPrice / tickSize / tickByTickAllLast → { type: 'ticker', source: 'IBKR', symbol, price, size, timestamp }
  * - reqHistoricalData 历史 K 线 → Kline[]（Unix 秒；REST / WS 全量快照）
  * - reqMktData / reqTickByTickData 的逐笔 tick → 经 KlineAggregator 合成 interval 周期的 K 线
@@ -29,9 +32,10 @@ type KlineFeed = 'bar' | 'tick'
  * 无实时权限时 IBKRClient 会自动回退延迟行情，并通过 onMarketDataType 通知前端展示。
  */
 export class IBKRAdapter extends BaseAdapter implements MarketDataAdapter {
-  private readonly client = new IBKRClient()
+  /** 全局唯一 IBKRClient（单例）：绝不在此 new，避免向 TWS 注册额外的 API 客户端 */
+  private readonly client: IBKRClient = getIBKRClient()
 
-  /** 连通性预检：等待 IB Gateway / TWS 连接就绪。 */
+  /** 连通性预检：等待 IB Gateway / TWS 连接就绪（复用全局唯一连接，不会新建连接）。 */
   ping(): Promise<void> {
     return this.client.waitForConnection()
   }
@@ -112,7 +116,8 @@ export class IBKRAdapter extends BaseAdapter implements MarketDataAdapter {
     let disposed = false
     let unsubscribeClient: (() => void) | null = null
     try {
-      // 内部先解析真实近月合约（reqContractDetails），再 reqMktData / reqTickByTickData
+      // 复用全局唯一连接：内部先解析真实近月合约（reqContractDetails），再 reqMktData / reqTickByTickData；
+      // 已有连接时只增加订阅（引用计数），不会重新 connect
       unsubscribeClient = await this.client.subscribeMarketData(symbol)
     } catch (err) {
       onError?.(err instanceof Error ? err.message : String(err))

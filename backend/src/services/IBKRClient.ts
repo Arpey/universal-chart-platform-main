@@ -93,6 +93,25 @@ const MARKET_DATA_TYPE_LABELS: Record<number, string> = {
 }
 
 /**
+ * 连接生命周期参数（全局唯一连接，见文件末尾 getIBKRClient）：
+ * - CONNECT_HANDSHAKE_TIMEOUT_MS：发出 socket 连接后等待 connected / disconnected 事件的上限。
+ *   超时会主动释放半开连接（TCP 已建但 IB 握手未完成 —— 否则该 socket 会一直占着 TWS 的客户端槽位
+ *   且永远不自己断开）并按重连间隔重试；
+ * - RECONNECT_DELAY_MS：断开后允许再次连接的最小间隔（默认 30s，可用 IBKR_RECONNECT_DELAY_MS 覆盖）。
+ *   TWS / IB Gateway 释放旧 clientId 需要时间，过快重连会被登记成「又一个 API 客户端」，
+ *   表现为 TWS 里出现大量客户端连接，因此断开后必须等满该时间窗再重连；
+ * - DISCONNECT_SETTLE_MS：disconnect() 后等待 socket 关闭（FIN/RST）落地的时间，避免同一 tick 内立刻重连。
+ */
+const CONNECT_HANDSHAKE_TIMEOUT_MS = 15_000
+const RECONNECT_DELAY_MS = config.ibkr.reconnectDelayMs
+const DISCONNECT_SETTLE_MS = 1_000
+
+/** setTimeout 的 Promise 封装（连接 / 重连等待用）。 */
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
  * 「实时行情不可用」错误码：收到后需停用仅实时可用的 reqTickByTickData，
  * 并按配置回退延迟行情（否则会只拿到空数据或错误刷屏）。
  * - 354：请求的行情未订阅（延迟行情也不可用）；
@@ -223,19 +242,34 @@ interface ContractPending {
  *   实时 K 线由上层（IBKRAdapter + KlineAggregator）用这些 tick 聚合得到（250ms 级刷新）；
  *   延迟行情下仅保留 reqMktData（延迟 tick），逐笔会被 IB 拒绝，故不发；
  * - getHistoricalKlines 通过 reqHistoricalData 一次性拉取历史 K 线（带超时保护）；
- * - 断线指数退避自动重连，重连后重新设置行情类型并恢复全部订阅。
+ * - 断线自动重连（断开后固定等待 RECONNECT_DELAY_MS，默认 30s），重连后重新设置行情类型并恢复全部订阅。
+ *
+ * 单例：构造函数私有，只能通过 getIBKRClient() / IBKRClient.getInstance() 获取全局唯一实例。
+ * 每个 IBApi 实例都会向 TWS / IB Gateway 注册一个 API 客户端，重复实例化正是
+ * 「TWS 里出现大量客户端连接」的根因，因此整个 backend 只允许存在一条 IBKR 连接。
  */
 export class IBKRClient {
+  /** 全局唯一实例（单例） */
+  private static instance: IBKRClient | null = null
+
   private ib: IBApi | null = null
   private readonly host: string
   private readonly port: number
   private readonly clientId: number
 
   private connected = false
+  /** 是否已下发 socket 连接、正在等待握手结果（由 connected / disconnected 事件结算） */
+  private connecting = false
   private stopped = false
   private connectionError = ''
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private reconnectAttempts = 0
+  /** 握手看门狗：仅在 connected / disconnected 事件丢失时复位 connecting，不新建连接 */
+  private handshakeTimer: ReturnType<typeof setTimeout> | null = null
+  /** 底层 TCP socket 是否处于「已创建 / 未确认关闭」状态（握手完成前后都为 true，close 事件 / 释放后置 false） */
+  private socketOpen = false
+  /** 最近一次断开时间（epoch ms）：用于强制「断开 → 重连」之间的最小间隔 */
+  private lastDisconnectAt = 0
 
   // ---- 行情类型（实时 / 延迟）状态 ----
   private readonly marketDataTypeListeners = new Set<MarketDataTypeListener>()
@@ -278,7 +312,7 @@ export class IBKRClient {
   private readonly contractPromises = new Map<string, Promise<Contract>>()
   private readonly contractPending = new Map<number, ContractPending>()
 
-  constructor() {
+  private constructor() {
     this.host = config.ibkr.host
     this.port = config.ibkr.port
     this.clientId = config.ibkr.clientId
@@ -286,6 +320,18 @@ export class IBKRClient {
     // 先按配置乐观判断：只有实时类型才请求逐笔 / 5 秒实时 K 线；若 IB 回延迟通知或「未订阅」错误会自动停用
     this.liveData = this.requestedMarketDataType === MarketDataType.REALTIME
     logger.info(`[IBKR] 客户端初始化: host=${this.host} port=${this.port} clientId=${this.clientId} 配置行情类型=${config.ibkr.marketDataType}(${this.requestedMarketDataType})${config.ibkr.debug ? '（IBKR_DEBUG=true，开启协议级日志）' : ''}`)
+  }
+
+  /**
+   * 获取全局唯一实例（单例）。
+   * 构造函数已私有化 —— 任何位置（含未来新增模块）都无法再用 `new IBKRClient()` 建出第二个连接。
+   */
+  static getInstance(): IBKRClient {
+    if (!IBKRClient.instance) {
+      IBKRClient.instance = new IBKRClient()
+      logger.info('[IBKR] 已创建全局唯一客户端实例（本进程后续调用均复用该实例，不再新建连接）')
+    }
+    return IBKRClient.instance
   }
 
   // ---------- 公共 API ----------
@@ -518,11 +564,59 @@ export class IBKRClient {
     }
   }
 
-  /** 确保底层连接已建立（懒连接：首次订阅时才触发）。 */
+  /**
+   * 建立（或复用）到 TWS / IB Gateway 的连接 —— 全进程唯一的连接入口。
+   *
+   * 幂等规则（避免 TWS 里出现大量客户端连接）：
+   * - 已连接 → 直接复用，绝不再发起连接；
+   * - connecting → 跳过（同一时刻只允许一次握手）；
+   * - 已有 IBApi 实例但尚未连上（处于重连窗口）→ 跳过，交由 scheduleReconnect 统一重连；
+   * - 距上次断开不足 RECONNECT_DELAY_MS → 先等待剩余时间（给 TWS 释放旧 clientId 的时间窗）。
+   *
+   * 正常流程下本方法只会在进程生命周期内真正发起一次连接，其余调用全部走「复用 / 跳过」分支。
+   */
+  async connect(): Promise<void> {
+    if (this.connected && this.ib?.isConnected) {
+      logger.info(`[IBKR] 已存在连接（${this.host}:${this.port} clientId=${this.clientId}），复用现有连接`)
+      return
+    }
+    if (this.connecting) {
+      logger.warn(`[IBKR] 正在连接中（clientId=${this.clientId}），跳过重复连接`)
+      return
+    }
+    if (this.ib) {
+      logger.warn(`[IBKR] 已有 IBApi 实例且尚未连接（clientId=${this.clientId}，isConnected=${this.ib.isConnected}），等待自动重连，跳过重复连接`)
+      return
+    }
+    // 断开 → 重连之间强制等待 RELEASE 窗口：TWS / IB Gateway 需要时间释放旧 clientId，
+    // 过早重连会被登记成「又一个客户端」（TWS 客户端列表不断增长）
+    const waitMs = this.lastDisconnectAt > 0 ? this.lastDisconnectAt + RECONNECT_DELAY_MS - Date.now() : 0
+    if (waitMs > 250) {
+      logger.info(`[IBKR] 距上次断开不足 ${Math.round(RECONNECT_DELAY_MS / 1000)}s，等待 ${Math.round(waitMs / 1000)}s 后再连接（避免 TWS 侧旧连接未释放）`)
+      await delay(waitMs)
+      // 等待期间可能有其它调用（并发订阅 / 重连定时器）已发起连接：必须重新判定，
+      // 否则两次调用都会走到 createConnection，产生两个 socket（TWS 侧即两个客户端）
+      if (this.connected || this.connecting || this.ib) {
+        logger.info(`[IBKR] 等待期间连接状态已变化（connected=${this.connected}, connecting=${this.connecting}, hasIb=${Boolean(this.ib)}），跳过重复连接`)
+        return
+      }
+    }
+    this.connecting = true
+    try {
+      this.createConnection()
+    } catch (err) {
+      this.connecting = false
+      const error = err instanceof Error ? err : new Error(String(err))
+      this.connectionError = error.message
+      logger.error(`[IBKR] 连接发起失败（clientId=${this.clientId}）`, error)
+      this.emitStatus(false, error)
+      throw error
+    }
+  }
+
+  /** 确保底层连接已建立（懒连接：首次订阅时才触发）。同步返回，连接结果由状态回调 / waitForConnection 结算。 */
   ensureConnected(): void {
-    if (this.ib?.isConnected) return
-    if (this.ib) return // 已创建实例，正处于连接 / 重连流程中
-    this.createConnection()
+    void this.connect().catch((err) => logger.warn(`[IBKR] 连接失败: ${err instanceof Error ? err.message : String(err)}`))
   }
 
   /** 等待连接就绪（供 WebSocket 预检 / REST 使用）。 */
@@ -552,11 +646,84 @@ export class IBKRClient {
     })
   }
 
-  /** 主动关闭连接（进程退出时调用）。 */
-  close(): void {
+  /**
+   * 彻底断开连接（进程退出 / 显式关闭）：停止自动重连 → 关闭并释放 socket → 重置连接与行情状态。
+   * 关键：this.ib 必须置空并移除全部监听，否则 TWS / IB Gateway 侧会残留客户端记录
+   * （「TWS 里出现大量客户端连接」的主因）。需要重新连接时由 connect() 发起，
+   * 且 connect() 会强制等满 RECONNECT_DELAY_MS 的释放窗口。
+   */
+  async disconnect(reason = 'manual'): Promise<void> {
     this.stopped = true
+    this.clearTimers()
+    const wasConnected = this.connected
+    logger.info(`[IBKR] 正在断开连接（reason=${reason}, clientId=${this.clientId}, connected=${wasConnected}, 订阅数=${this.activeSubscriptions.size}）`)
+    this.disposeIb()
+    this.connected = false
+    this.connecting = false
+    this.lastDisconnectAt = Date.now()
+    // 连接断开后行情类型状态未知，重连成功时由 handleConnected 重新请求
+    this.marketDataType = null
+    // 行情缓存随连接一起失效，避免重连后展示过期价格
+    this.lastPrice.clear()
+    this.lastSize.clear()
+    this.lastTs.clear()
+    this.lastEmit.clear()
+    // 等待 socket 关闭落地，避免同一 tick 内立刻重连
+    await delay(DISCONNECT_SETTLE_MS)
+    logger.info(`[IBKR] 已断开连接（clientId=${this.clientId}），${Math.round(RECONNECT_DELAY_MS / 1000)}s 内不再重连（可用 IBKR_RECONNECT_DELAY_MS 调整）`)
+    this.emitStatus(false)
+  }
+
+  /**
+   * 关闭连接（同步版，进程退出时调用）。
+   * disconnect() 在首个 await 之前就已完成状态清理与 socket 断开，因此这里无需 await。
+   */
+  close(): void {
+    void this.disconnect('close()')
+  }
+
+  /** 释放底层 IBApi 实例：断开 socket（含「TCP 已连、IB 握手未完成」的半开连接）+ 移除全部事件监听。 */
+  private disposeIb(): void {
+    const ib = this.ib
+    if (!ib) { this.socketOpen = false; return }
+    this.ib = null
+    try {
+      // 半开连接（socketOpen=true 但 isConnected=false）同样必须 destroy，否则该 socket 会一直挂着：
+      // TWS 侧残留客户端槽位，且本身也无法重连
+      if (this.socketOpen || ib.isConnected) ib.disconnect()
+    } catch (err) {
+      logger.error('[IBKR] 断开底层 socket 失败（忽略）', err)
+    }
+    this.socketOpen = false
+    ib.removeAllListeners()
+  }
+
+  /** 清空全部定时器（重连 / 握手看门狗）。 */
+  private clearTimers(): void {
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null }
-    this.ib?.disconnect()
+    this.clearHandshakeWatchdog()
+  }
+
+  /**
+   * 启动握手看门狗：超时未收到 connected / disconnected 事件时，
+   * 释放半开连接（TCP 已建立但 IB 握手未完成）并按退避间隔重试 ——
+   * 这类 socket 既占着 TWS 的客户端槽位，又永远不会自己断开，必须主动回收。
+   */
+  private startHandshakeWatchdog(): void {
+    this.clearHandshakeWatchdog()
+    this.handshakeTimer = setTimeout(() => {
+      this.handshakeTimer = null
+      if (!this.connecting && !this.socketOpen) return
+      this.connecting = false
+      logger.warn(`[IBKR] 连接握手超时（${CONNECT_HANDSHAKE_TIMEOUT_MS}ms 内未收到 connected/disconnected 事件，clientId=${this.clientId}），释放半开连接并准备重连`)
+      this.disposeIb()
+      this.lastDisconnectAt = Date.now()
+      this.scheduleReconnect()
+    }, CONNECT_HANDSHAKE_TIMEOUT_MS)
+  }
+
+  private clearHandshakeWatchdog(): void {
+    if (this.handshakeTimer) { clearTimeout(this.handshakeTimer); this.handshakeTimer = null }
   }
 
   // ---------- 连接生命周期 ----------
@@ -566,7 +733,10 @@ export class IBKRClient {
     this.connectionError = ''
     const ib = new IBApi({ host: this.host, port: this.port })
     this.ib = ib
+    // 每次新建 IBApi 都会向 TWS / IB Gateway 注册一个 API 客户端，
+    // 因此本方法只允许由 connect() 在「确认无连接、无实例」时调用。
     logger.info(`[IBKR] 正在连接 ${this.host}:${this.port}（clientId=${this.clientId}）...`)
+    this.startHandshakeWatchdog()
     // ---- 连接生命周期 / 握手相关事件（全量监听，便于按 ErrorCode 定位） ----
     ib.on(EventName.connected, () => this.handleConnected())
     ib.on(EventName.disconnected, () => this.handleDisconnected())
@@ -589,15 +759,20 @@ export class IBKRClient {
     ib.on(EventName.historicalData, (reqId, date, open, high, low, close, volume) => this.handleHistoricalData(reqId, date, open, high, low, close, volume))
     ib.on(EventName.contractDetails, (reqId, contractDetails) => this.handleContractDetails(reqId, contractDetails))
     ib.on(EventName.contractDetailsEnd, (reqId) => this.handleContractDetailsEnd(reqId))
+    // 唯一的一处 socket 连接发起：clientId 固定取自配置（IBKR_CLIENT_ID，默认 1）
     ib.connect(this.clientId)
+    // TCP socket 已创建（握手结果由 connected / disconnected 事件结算）
+    this.socketOpen = true
   }
 
   private handleConnected(): void {
     this.connected = true
+    this.connecting = false
+    this.clearHandshakeWatchdog()
     this.connectionError = ''
     this.lastError = ''
     this.reconnectAttempts = 0
-    logger.info(`[IBKR] 已连接 ${this.host}:${this.port}（clientId=${this.clientId}）`)
+    logger.info(`[IBKR] 连接成功 ${this.host}:${this.port}（clientId=${this.clientId}，复用全局唯一客户端实例，未新建额外连接）`)
     // 按配置请求行情类型（默认 REALTIME=1；可用 IBKR_MARKET_DATA_TYPE=delayed 强制免费延迟行情）。
     // TWS 每次重连后都会重置行情类型，因此这里必须在每次连接成功后重新设置。
     this.fallbackApplied = false
@@ -613,27 +788,44 @@ export class IBKRClient {
   }
 
   private handleDisconnected(): void {
+    const wasConnected = this.connected
     this.connected = false
+    this.connecting = false
+    this.socketOpen = false // socket 已由库关闭，无需再 destroy
+    this.clearHandshakeWatchdog()
     // 连接断开后行情类型状态未知，重连成功时会重新请求（由 handleConnected 负责）
     this.marketDataType = null
     this.lastPrice.clear()
     this.lastSize.clear()
     this.lastTs.clear()
     this.lastEmit.clear()
-    logger.warn('[IBKR] 连接断开，准备自动重连...')
+    // 立刻释放旧实例：TWS / IB Gateway 只有在 socket 真正关闭后才释放 clientId，
+    // 残留实例会让紧随其后的重连被登记成「又一个客户端」（TWS 客户端列表不断增长）
+    this.disposeIb()
+    this.lastDisconnectAt = Date.now()
+    logger.warn(wasConnected
+      ? `[IBKR] 连接断开（clientId=${this.clientId}，保留订阅=${this.activeSubscriptions.size}），${Math.round(RECONNECT_DELAY_MS / 1000)}s 后自动重连...`
+      : `[IBKR] 连接失败 / 未建立（clientId=${this.clientId}），${Math.round(RECONNECT_DELAY_MS / 1000)}s 后重试...`)
     this.emitStatus(false)
     this.scheduleReconnect()
   }
 
+  /**
+   * 断线 / 连接失败后的自动重连：
+   * 固定等待 RECONNECT_DELAY_MS（默认 30s，带 0~1s 抖动）让 TWS / IB Gateway 释放旧 clientId，
+   * 到点后先确认旧实例已释放，再走统一的 connect()（复用同一 clientId，不产生新的客户端编号）。
+   */
   private scheduleReconnect(): void {
     if (this.stopped || this.reconnectTimer) return
-    const delay = Math.min(1000 * 2 ** this.reconnectAttempts, 30_000) + Math.floor(Math.random() * 500)
+    const waitMs = RECONNECT_DELAY_MS + Math.floor(Math.random() * 1000)
     this.reconnectAttempts += 1
+    logger.info(`[IBKR] 将于 ${Math.round(waitMs / 1000)}s 后尝试第 ${this.reconnectAttempts} 次重连（clientId=${this.clientId}）`)
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
-      this.ib?.connect(this.clientId)
-      // 若本轮连接仍失败，socket 会再次触发 error / disconnected → 继续指数退避重连
-    }, delay)
+      if (this.stopped) return
+      this.disposeIb() // 双保险：旧 socket 已释放（通常已在 handleDisconnected 中释放）
+      void this.connect().catch((err) => logger.warn(`[IBKR] 重连失败: ${err instanceof Error ? err.message : String(err)}`))
+    }, waitMs)
   }
 
   private handleError(err: Error, code: ErrorCode, reqId: number): void {
@@ -672,7 +864,7 @@ export class IBKRClient {
   private handleInfo(message: string, code: number): void {
     if (code === 326) {
       this.connectionError = `${message}（InfoCode=326，clientId=${this.clientId} 已被占用）`
-      logger.warn(`[IBKR] 连接被拒绝: InfoCode=326（clientId=${this.clientId} 已被其他客户端占用）。请修改 IBKR_CLIENT_ID 或删除该配置以使用随机 ID。原始信息: ${message}`)
+      logger.warn(`[IBKR] 连接被拒绝: InfoCode=326（clientId=${this.clientId} 已被其他客户端占用）。请设置 IBKR_CLIENT_ID 换一个未被占用的编号，并确认没有第二个后端 / TWS 实例使用同一编号。原始信息: ${message}`)
       return
     }
     logger.info(`[IBKR] 通知(InfoCode=${code}): ${message}`)
@@ -876,4 +1068,16 @@ export class IBKRClient {
       try { listener(connected, error) } catch (err) { logger.error('[IBKR] 状态回调异常', err) }
     }
   }
+}
+
+/**
+ * 全局唯一 IBKRClient 实例（单例工厂）——
+ * 整个 backend 进程只维护一条到 TWS / IB Gateway 的连接：所有行情订阅、历史请求、状态查询
+ * 都必须通过本函数（或 IBKRClient.getInstance()）获取客户端并复用同一条连接。
+ *
+ * 禁止再直接 `new IBKRClient()`：每个 IBApi 实例都会向 TWS 注册一个 API 客户端，
+ * 重复实例化正是「TWS 里出现大量客户端连接」的根因；TS 层面构造函数已私有化以杜绝该写法。
+ */
+export function getIBKRClient(): IBKRClient {
+  return IBKRClient.getInstance()
 }
