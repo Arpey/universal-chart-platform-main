@@ -201,17 +201,20 @@ export class TradovateAdapter extends BaseAdapter implements MarketDataAdapter {
     await this.client.ensureAuth()
   }
 
-  async getKlines(symbol: string, interval: Interval, limit = 300): Promise<Kline[]> {
+  async getKlines(symbol: string, interval: Interval, limit = 300, endTime?: number): Promise<Kline[]> {
     const contract = resolveContract(symbol)
-    const now = new Date()
-    const start = new Date(now.getTime() - limit * intervalMs(interval) * 3) // 留 3 倍余量保证取满
+    // endTime（10 位 Unix 秒，可选）：分页边界 —— 取该时间之前的最近 limit 根。
+    // Tradovate REST 的 startDate/endDate 为「日期」粒度（yyyy-MM-dd），因此日内分页按天对齐，
+    // 由 BaseAdapter 侧再按 endTime 精确过滤 + 截取最近 limit 根，不会与上一页重叠。
+    const endMs = Number.isFinite(endTime) && (endTime ?? 0) > 0 ? Math.floor(endTime as number) * 1000 : Date.now()
+    const start = new Date(endMs - limit * intervalMs(interval) * 3) // 留 3 倍余量保证取满
     try {
       const rows = await this.client.restGet<TradovateCandle[]>('/marketdata/query/candle', {
         symbol: contract,
         chartType: 'Candlestick',
         interval,
         startDate: toDateStr(start),
-        endDate: toDateStr(now),
+        endDate: toDateStr(new Date(endMs)),
         max: limit,
       })
       const klines = collectLast(rows.map(toKline), limit)

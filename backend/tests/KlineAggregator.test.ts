@@ -2,7 +2,7 @@
  * K 线聚合器单元测试：时间戳对齐（毫秒→秒、按周期向下取整）、
  * 同周期 OHLCV 合并、跨周期开新根、乱序数据丢弃、历史播种合并（vitest）。
  */
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { KlineAggregator, alignToInterval, toEpochMs, toEpochSeconds } from '../src/core/KlineAggregator'
 
 describe('KlineAggregator 时间戳归一化', () => {
@@ -140,3 +140,88 @@ describe('KlineAggregator 历史播种', () => {
     expect(agg.current).toEqual({ time: base, open: 100, high: 100, low: 100, close: 100, volume: 1 })
   })
 })
+
+describe('KlineAggregator 跨周期时间戳连续性（缺口 / 网格不一致 / 严格升序）', () => {
+  const base = Math.floor(1_789_000_000 / 300) * 300 // 5m 网格起点
+
+  it('数据源缺口时只推进一个周期（不再用 Math.max 把时间戳推到 bucket 造成跳跃）', () => {
+    const agg = new KlineAggregator('1m')
+    const first = agg.push({ price: 100, size: 1, timestamp: base })
+    // 跳过若干周期后才来数据：新根时间必须是「上一根 + 1 个周期」，而不是 tick 的 bucket
+    const second = agg.push({ price: 110, size: 1, timestamp: base + 600 })
+    const third = agg.push({ price: 120, size: 1, timestamp: base + 1200 })
+    expect(first?.time).toBe(base)
+    expect(second?.time).toBe(base + 60)
+    expect(third?.time).toBe(base + 120)
+  })
+
+  it('缺口场景下 K 线时间戳步长恒定（不跳变、不回退）', () => {
+    const agg = new KlineAggregator('5m')
+    const times: number[] = []
+    // 时间戳在 5m 网格上跳跃（模拟数据源断流）
+    for (const offset of [0, 1500, 9000, 9300]) {
+      const bar = agg.push({ price: 100 + offset, size: 1, timestamp: base + offset })
+      if (bar) times.push(bar.time)
+    }
+    expect(times).toEqual([base, base + 300, base + 600, base + 900])
+    for (let i = 1; i < times.length; i += 1) expect(times[i]).toBeGreaterThan(times[i - 1])
+  })
+
+  it('历史播种时间戳未落在周期网格上时先归一到网格，实时 tick 不会被误判为迟到（4h 交易所会话网格）', () => {
+    const agg = new KlineAggregator('4h', { symbol: 'MES' })
+    const grid = Math.floor(1_789_000_000 / 14400) * 14400
+    const offGrid = grid + 7200 // CME（US/Central）4h bar 相对 UTC 4h 网格偏移 2 小时
+    const seeded = agg.seed({ time: offGrid, open: 100, high: 101, low: 99, close: 100.5, volume: 5 })
+    expect(seeded?.time).toBe(grid) // 播种即对齐到本周期网格
+    // 实时 tick 的 bucket 与播种根同网格 → 正常合并（否则会被整段丢弃，图表数小时不刷新）
+    const bar = agg.push({ price: 102, size: 3, timestamp: offGrid + 10 })
+    expect(bar).not.toBeNull()
+    expect(bar?.time).toBe(grid)
+    expect(bar?.volume).toBe(8) // 历史 volume 5 + 实时 3
+    expect(bar?.close).toBe(102)
+  })
+
+  it('同周期实时刷新仍然产出（严格升序校验不会丢弃同一根 K 线的 update）', () => {
+    const agg = new KlineAggregator('5m')
+    const first = agg.push({ price: 100, size: 1, timestamp: base + 5 })
+    const second = agg.push({ price: 101, size: 2, timestamp: base + 200 })
+    expect(first?.time).toBe(base)
+    expect(second?.time).toBe(base) // 同一根：前端 update() 依赖它刷新当前蜡烛
+    expect(second?.close).toBe(101)
+    expect(agg.lastEmitted).toBe(base)
+  })
+
+  it('reset() 清空 bar / lastEmitted 后可从任意时间重新开始；dispose() 后不再产出', () => {
+    const agg = new KlineAggregator('1m')
+    agg.push({ price: 100, size: 1, timestamp: base })
+    expect(agg.lastEmitted).toBe(base)
+    agg.reset()
+    expect(agg.current).toBeNull()
+    expect(agg.lastEmitted).toBeNull()
+    // 状态已清空：更早的时间戳也能被接受（不会被旧周期的 lastEmittedTime 判为回退）
+    expect(agg.push({ price: 90, size: 1, timestamp: base - 60 })?.time).toBe(base - 60)
+    agg.dispose()
+    expect(agg.isDisposed).toBe(true)
+    expect(agg.push({ price: 91, size: 1, timestamp: base })).toBeNull()
+    expect(agg.seed({ time: base, open: 1, high: 1, low: 1, close: 1, volume: 1 })).toBeNull()
+  })
+
+  it('迟到数据丢弃时输出带 symbol / interval / step / 输入时间戳的 warn 诊断日志', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const agg = new KlineAggregator('15m', { symbol: 'MES' })
+      agg.push({ price: 100, size: 1, timestamp: base })
+      const lateTs = base - 900
+      expect(agg.push({ price: 90, size: 1, timestamp: lateTs })).toBeNull()
+      expect(warn).toHaveBeenCalledTimes(1)
+      const line = String(warn.mock.calls[0][0])
+      expect(line).toContain('MES')
+      expect(line).toContain('15m')
+      expect(line).toContain('step=900s')
+      expect(line).toContain(`ts=${lateTs}`)
+    } finally {
+      warn.mockRestore()
+    }
+  })
+})
+

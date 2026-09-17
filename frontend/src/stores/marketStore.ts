@@ -1,7 +1,8 @@
 import { defineStore } from 'pinia'
 import { computed, ref, shallowRef } from 'vue'
 import type { DataSource, Dom, Interval, Kline, MarketView, Quote, Source, SymbolInfo, Ticker, TradeTick } from '../types'
-import { fetchMarket, fetchSymbols, fetchTickers } from '../services/chartService'
+import { fetchKlineHistory, fetchSymbols, fetchTicker, fetchTickers } from '../services/chartService'
+import { HISTORY_BAR_LIMIT_RESOLVED } from '../constants/intervals'
 import { normalizeKline, normalizeKlines } from '../utils/klineSeries'
 
 const DEFAULT_SYMBOL: Record<DataSource, string> = { binance: 'BTCUSDT', tradovate: 'NQ', tradefi: 'XAUUSDT', ibkr: 'MES' }
@@ -24,6 +25,17 @@ export const useMarketStore = defineStore('market', () => {
   const klineVersion = ref(0)
   /** 当前（未收盘）K 线的开盘时间（10 位 Unix 秒）：仅跨周期换线时变化，供倒计时 / 分页使用。 */
   const lastBarTime = ref(0)
+  /**
+   * 历史 K 线快照最后一根的时间（10 位 Unix 秒）：实时数据与之衔接的边界。
+   * 规则（避免历史与实时重叠 / 断档）：实时 bar.time < 边界 → 丢弃；== 边界 → 覆盖最后一根；> 边界 → 追加新根。
+   */
+  const lastHistoricalTime = ref(0)
+  /** 历史请求序号：快速连续切换 symbol / interval 时丢弃过期响应（避免旧品种数据覆盖新品种）。 */
+  let historyRequestSeq = 0
+  /** 是否还存在更早的历史 K 线（后端 hasMore）：false 时图表不再向后分页。 */
+  const hasMoreHistory = ref(false)
+  /** 向后分页（加载更早 K 线）请求进行中：防止拖动时间轴时高频重入。 */
+  const historyLoading = ref(false)
   /** K 线根数：仅在结构性变化（新增 / 整表替换 / 裁掉最旧）时更新，避免每 tick 触发列表重建。 */
   const barCount = ref(0)
   const symbols = ref<SymbolInfo[]>([]); const tickers = ref<Ticker[]>([]); const universeLoading = ref(false); const universeError = ref('')
@@ -40,21 +52,109 @@ export const useMarketStore = defineStore('market', () => {
    */
   const ibkrMarketDataType = ref<number | null>(null)
 
-  async function load() {
+  /**
+   * 加载历史 K 线并整表替换（切换 symbol / interval 后的第一步，TradingView 风格：
+   * 先铺满最近 HISTORY_BAR_LIMIT 根，渲染完成后才建立实时订阅）。
+   *
+   * 流程：REST 拉取 → 归一化（10 位 Unix 秒 / 按周期网格对齐 / 升序 / 去重）→ setKlines（图表 setData + 整表重绘）
+   * → 记录 lastHistoricalTime（实时衔接边界）。数据源不支持历史时返回空数组，不视为失败（等实时流补图）。
+   * 过期响应（期间又切换了 symbol / interval / 数据源，或已 clearMarketData）会被直接丢弃。
+   * @returns 是否成功（含「数据源无历史」= true；仅网络 / 接口报错为 false，供 UI 提示与重试判断）
+   */
+  async function loadHistory(options: { source?: DataSource; limit?: number } = {}): Promise<boolean> {
+    const source = options.source ?? datasource.value
+    const limit = options.limit ?? HISTORY_BAR_LIMIT_RESOLVED
+    const requestSymbol = symbol.value
+    const requestInterval = interval.value
+    const seq = ++historyRequestSeq
     loading.value = true; error.value = ''
     try {
-      const result = await fetchMarket(symbol.value, interval.value, datasource.value)
-      setKlines(result.klines)
-      ticker.value = result.ticker
-    } catch (e) { error.value = e instanceof Error ? e.message : '加载失败' } finally { loading.value = false }
+      const page = await fetchKlineHistory(requestSymbol, requestInterval, source, limit)
+      if (seq !== historyRequestSeq) return false
+      if (requestSymbol !== symbol.value || requestInterval !== interval.value) return false
+      const bars = page.bars
+      // 只保留最近 limit 根（后端已裁剪，这里再兜底一次，保证「不多不少」）
+      setKlines(bars.length > limit ? bars.slice(bars.length - limit) : bars)
+      // 分页游标：是否还有更早的数据（后端 hasMore；空数据源 → false，不再分页）
+      hasMoreHistory.value = bars.length > 0 && (page.hasMore || bars.length >= limit)
+      const last = klines.value.at(-1)
+      lastHistoricalTime.value = last ? last.time : 0
+      if (last) {
+        ticker.value = ticker.value
+          ? { ...ticker.value, price: last.close, updatedAt: Date.now() }
+          : { symbol: requestSymbol, price: last.close, change24h: 0, volume24h: 0, updatedAt: Date.now() }
+      }
+      return true
+    } catch (e) {
+      if (seq === historyRequestSeq) error.value = e instanceof Error ? e.message : '历史 K 线加载失败'
+      return false
+    } finally {
+      if (seq === historyRequestSeq) loading.value = false
+    }
+  }
+
+  /** 顶栏行情快照（只取最新价；失败静默，不阻塞历史渲染与实时订阅）。 */
+  async function loadTicker() {
+    try {
+      const snapshot = await fetchTicker(symbol.value, datasource.value)
+      if (snapshot && Number.isFinite(snapshot.price) && snapshot.price > 0) ticker.value = snapshot
+    } catch { /* 顶栏价格可由实时流补上，忽略快照失败 */ }
+  }
+
+  /** 兼容入口：历史 K 线（最近 HISTORY_BAR_LIMIT 根）+ 顶栏行情快照（并行、各自容错）。 */
+  async function load() {
+    await Promise.allSettled([loadHistory(), loadTicker()])
+  }
+
+  /**
+   * 向左分页：加载更早的历史 K 线（图表拖动时间轴到最左侧时触发）。
+   *
+   * - `endTime` = 当前最早一根的时间：后端只返回**严格早于**它的最近 HISTORY_BAR_LIMIT 根，页与页不重叠；
+   * - 合并去重（严格早于当前最早一根 + 去掉已存在的 time）后经 setKlines 整表写入，
+   *   图表走全量 setData，随后由图表侧按新增根数补偿视口偏移（画面不跳动）；
+   * - 并发 / 已切换品种 / 请求失败 → 返回 null（图表保持 hasMore 不变，稍后可重试）。
+   *
+   * @returns 新增（前置）的根数；0 = 没有更早的数据（hasMore=false）；null = 本次跳过
+   */
+  async function loadMoreHistory(): Promise<number | null> {
+    const bars = klines.value
+    const oldest = bars.length ? bars[0].time : 0
+    if (!oldest || !hasMoreHistory.value) return 0
+    if (historyLoading.value) return null
+    const requestSymbol = symbol.value
+    const requestInterval = interval.value
+    const seq = historyRequestSeq
+    historyLoading.value = true
+    try {
+      const page = await fetchKlineHistory(requestSymbol, requestInterval, datasource.value, HISTORY_BAR_LIMIT_RESOLVED, oldest)
+      if (seq !== historyRequestSeq) return null
+      if (requestSymbol !== symbol.value || requestInterval !== interval.value) return null
+      const known = new Set(bars.map((bar) => bar.time))
+      const older = normalizeKlines(page.bars, interval.value)
+        .filter((bar) => bar.time < oldest && !known.has(bar.time))
+      if (!older.length) {
+        // 上游没有更早的数据（或数据源不支持分页）→ 停止继续向左分页
+        hasMoreHistory.value = false
+        return 0
+      }
+      setKlines([...older, ...bars])
+      hasMoreHistory.value = page.hasMore
+      lastDataAt.value = Date.now()
+      return older.length
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : '更早的 K 线加载失败'
+      return null
+    } finally {
+      historyLoading.value = false
+    }
   }
 
   /**
    * 结构性写入（历史快照 / 分页 / 加载 / 清空）：整表替换并同步轻量信号。
-   * 归一化保证 10 位 Unix 秒 + 严格升序（图表 setData 要求），属于低频操作、非 tick 热路径。
+   * 归一化保证 10 位 Unix 秒 + 按当前周期网格对齐 + 严格升序（图表 setData 要求），属于低频操作、非 tick 热路径。
    */
   function setKlines(next: readonly Kline[]) {
-    const bars = normalizeKlines(next)
+    const bars = normalizeKlines(next, interval.value)
     klines.value = bars
     barCount.value = bars.length
     lastBarTime.value = bars.length ? bars[bars.length - 1].time : 0
@@ -161,6 +261,12 @@ export const useMarketStore = defineStore('market', () => {
     trades.value = []
     lastDataAt.value = 0
     ibkrMarketDataType.value = null
+    // 历史衔接边界与在途历史请求一并失效：避免旧品种/旧周期的响应写回图表
+    lastHistoricalTime.value = 0
+    historyRequestSeq += 1
+    // 分页状态重置：新标的/周期从「暂无更早数据」开始，由随后的 loadHistory 按后端 hasMore 重新置位
+    hasMoreHistory.value = false
+    historyLoading.value = false
   }
 
   /**
@@ -173,12 +279,18 @@ export const useMarketStore = defineStore('market', () => {
    * - 跨入新周期（time 更大）：追加一根全新 K 线。
    */
   function update(kline: Kline) {
-    const next = normalizeKline(kline)
+    // 归一化 + 按当前周期网格对齐：与历史快照落在同一网格上，跨周期切换后不会出现错位/断点
+    const next = normalizeKline(kline, interval.value)
     if (!next) return
     const bars = klines.value
     const last = bars.length ? bars[bars.length - 1] : null
-    // 防乱序：早于最后一根的迟到数据直接丢弃（不刷新「最近收到行情」时间戳）
-    if (last && next.time < last.time) return
+    // ---- 历史 / 实时衔接规则（避免与历史最后一根重叠或断档）----
+    // 边界 = 历史快照最后一根的时间（lastHistoricalTime；与当前最后一根取较大值兜底）：
+    //   next.time <  边界 → 历史已覆盖过的重复数据，丢弃；
+    //   next.time === 边界 === last.time → 用实时数据覆盖最后一根（update 语义）；
+    //   next.time >  边界 → 追加为新 K 线（append 语义）。
+    const boundary = Math.max(last?.time ?? 0, lastHistoricalTime.value)
+    if (next.time < boundary) return
     if (last && next.time === last.time) {
       // 同周期：原地更新最后一根（零数组分配；图表随后拿到全新的 Bar 对象覆盖当前蜡烛）
       last.open = next.open
@@ -256,10 +368,10 @@ export const useMarketStore = defineStore('market', () => {
 
   return {
     datasource, currentSource, availableSources, view, symbol, interval, klines, ticker, loading, error,
-    klineVersion, lastBarTime, barCount,
+    klineVersion, lastBarTime, barCount, lastHistoricalTime, hasMoreHistory, historyLoading,
     symbols, tickers, universeLoading, universeError,
     quote, dom, trades, domConnected, lastDataAt, ibkrMarketDataType,
-    load, loadUniverse, setDatasource, switchSource, setView, setSymbol,
+    load, loadHistory, loadMoreHistory, loadTicker, loadUniverse, setDatasource, switchSource, setView, setSymbol,
     update, applyHist, setQuote, setDom, addTrade, setPrice, setIbkrMarketDataType,
     applySymbols,
     clearMarketData,

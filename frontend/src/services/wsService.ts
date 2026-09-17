@@ -167,8 +167,20 @@ export function connectIBKR(opts: IBKRConnectOptions): IBKRConnection {
   }
   const requestSymbols = () => send({ action: 'get_symbols', source: 'IBKR' })
   const subscribe = () => send({ action: 'subscribe', source: 'IBKR', symbol: opts.symbol, interval: opts.interval })
+  /** 显式退订（断开前调用）：让后端立刻 dispose 旧周期的聚合器，而不是等 socket close 事件兜底。 */
+  const unsubscribe = () => send({ action: 'unsubscribe', source: 'IBKR', symbol: opts.symbol, interval: opts.interval })
   /** 分页拉取更早历史 K 线（向后端透传最左侧时间戳）。 */
   const loadMoreHistory = (endDateTime: number) => send({ action: 'load_more_history', source: 'IBKR', symbol: opts.symbol, interval: opts.interval, endDateTime })
+  /**
+   * 消息归属校验：切换周期 / 标的瞬间，旧订阅仍在途的 hist / kline 仍可能到达。
+   * 若不过滤就写进 store，旧周期（旧步长）的时间戳会被渲染到新周期的图表序列上 ——
+   * 表现为断点、时间戳跳跃、K 线错位或空白。后端消息带 symbol + interval 标识，据此丢弃过期数据。
+   */
+  const inScope = (msg: { symbol?: string; interval?: string }) => {
+    if (msg.symbol != null && String(msg.symbol).toUpperCase() !== opts.symbol.toUpperCase()) return false
+    if (msg.interval != null && String(msg.interval) !== opts.interval) return false
+    return true
+  }
 
   const connect = () => {
     if (stopped) return
@@ -185,6 +197,7 @@ export function connectIBKR(opts: IBKRConnectOptions): IBKRConnection {
         data?: unknown
         message?: string
         symbol?: string
+        interval?: string
         price?: number
         size?: number
         timestamp?: number
@@ -201,6 +214,8 @@ export function connectIBKR(opts: IBKRConnectOptions): IBKRConnection {
           if (Array.isArray(msg.data)) opts.onSymbols?.(msg.data as IBKRSymbolInfo[])
           break
         case 'ticker':
+          // 旧标的 / 旧周期的 tick 直接丢弃（ticker 消息带 symbol，但无 interval → 仅校验 symbol）
+          if (!inScope({ symbol: msg.symbol })) break
           if (typeof msg.price === 'number' && Number.isFinite(msg.price) && msg.price > 0) {
             opts.onTick?.({
               symbol: String(msg.symbol ?? opts.symbol),
@@ -212,10 +227,10 @@ export function connectIBKR(opts: IBKRConnectOptions): IBKRConnection {
           }
           break
         case 'kline':
-          if (msg.data) opts.onKline?.(msg.data as Kline)
+          if (msg.data && inScope(msg)) opts.onKline?.(msg.data as Kline)
           break
         case 'hist':
-          if (Array.isArray(msg.data)) opts.onHist?.(msg.data as Kline[], Boolean(msg.append))
+          if (Array.isArray(msg.data) && inScope(msg)) opts.onHist?.(msg.data as Kline[], Boolean(msg.append))
           break
         case 'connected':
           opts.onState?.(true)
@@ -251,6 +266,9 @@ export function connectIBKR(opts: IBKRConnectOptions): IBKRConnection {
     disconnect: () => {
       stopped = true // 清理后永不重连，防止旧连接定时器泄漏
       if (reconnectTimer !== null) window.clearTimeout(reconnectTimer)
+      // 先显式退订（后端据此立即 dispose 本周期聚合器），再关闭连接；
+      // 这样切换周期时旧周期的聚合器/历史缓存在后端被确定性地清理，而不是等 close 事件兜底。
+      unsubscribe()
       socket?.close()
       socket = null
     },

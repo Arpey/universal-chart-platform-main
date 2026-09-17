@@ -4,6 +4,7 @@ import { MarketManager } from './MarketManager'
 import type { MarketDataAdapter } from '../types/adapter'
 import type { Interval } from '../types/kline'
 import { IBKR_CME_SYMBOLS } from '../services/IBKRClient'
+import { HISTORY_BAR_LIMIT } from './intervals'
 import { config } from '../utils/config'
 import { logger } from '../utils/logger'
 
@@ -46,13 +47,33 @@ export function attachMarketSocket(server: Server, manager = new MarketManager()
     const dataType = (query.get('dataType') ?? 'kline') as WsDataType
 
     let unsubscribe: (() => void) | null = null
-    // IBKR 消息驱动订阅集合：symbol -> 取消函数（client 断开时统一清理）
+    /**
+     * IBKR 消息驱动订阅集合：key = `${symbol}|${interval}` -> 取消函数（client 断开时统一清理）。
+     *
+     * 必须把 interval 纳入 key：同一标的切换周期时前端可能在同一条控制通道上重新 subscribe，
+     * 若只按 symbol 去重，新周期的订阅会被直接忽略，而旧周期聚合器会继续用旧步长推送 K 线 ——
+     * 表现为「切到 5m/15m/1h/4h/1d 后 K 线断点 / 时间戳跳跃 / 错位」。
+     */
     const ibkrSubscriptions = new Map<string, () => void>()
+    /** 最近一次请求订阅的 key：用于丢弃「周期已再次切换」后才 resolve 的过期订阅（并发预检竞态）。 */
+    let ibkrRequestedKey: string | null = null
+    /** 释放某标的的 IBKR 订阅：interval 指定时只释放该周期，否则释放该标的的全部周期订阅。 */
+    const releaseIbkrSubscriptions = (symbol: string, interval?: string) => {
+      const prefix = `${symbol}|`
+      for (const key of [...ibkrSubscriptions.keys()]) {
+        if (!key.startsWith(prefix)) continue
+        if (interval !== undefined && key !== `${prefix}${interval}`) continue
+        ibkrSubscriptions.get(key)?.()
+        ibkrSubscriptions.delete(key)
+        if (ibkrRequestedKey === key) ibkrRequestedKey = null
+      }
+    }
     const cleanup = () => {
       unsubscribe?.() // 幂等：只清理一次
       unsubscribe = null
       for (const unsub of ibkrSubscriptions.values()) unsub()
       ibkrSubscriptions.clear()
+      ibkrRequestedKey = null
     }
     const send = (payload: unknown) => {
       if (client.readyState === client.OPEN) client.send(JSON.stringify(payload))
@@ -84,19 +105,26 @@ export function attachMarketSocket(server: Server, manager = new MarketManager()
         return
       }
 
+      // 订阅标识必须包含 interval（周期切换时旧订阅必须被完整释放）
+      const subscriptionKey = `${symbol}|${interval}`
+
       if (action === 'subscribe') {
         const adapter = ibkrAdapter
         if (!adapter?.subscribeTick || !adapter.subscribeBar) {
           send({ type: 'error', message: 'IBKR 数据源未启用（请检查 IBKR_ENABLED 配置）' })
           return
         }
-        if (ibkrSubscriptions.has(symbol)) return // 同一 client 重复订阅去重
+        if (ibkrSubscriptions.has(subscriptionKey)) return // 同一 client 重复订阅同一 symbol+interval 去重
+        // 周期切换：先释放该标的的旧周期订阅（IBKRAdapter 会 dispose 旧聚合器并清出缓存），再为新周期重建
+        releaseIbkrSubscriptions(symbol)
+        ibkrRequestedKey = subscriptionKey
         // 连接预检：等待本地 IB Gateway / TWS 就绪，失败时向前端返回明确错误
         const preflight = adapter.ping?.() ?? Promise.resolve()
         preflight
           .then(async () => {
             if (client.readyState !== client.OPEN) return
-            if (ibkrSubscriptions.has(symbol)) return
+            if (ibkrRequestedKey !== subscriptionKey) return // 周期已被再次切换 → 本次订阅已过期
+            if (ibkrSubscriptions.has(subscriptionKey)) return
             const unsubs: Array<() => void> = []
             // 0) 底层连接状态：断线/重连时广播给客户端（前端据此提示）
             const unsubStatus = adapter.onStatus?.((connected, error) => {
@@ -131,14 +159,16 @@ export function attachMarketSocket(server: Server, manager = new MarketManager()
               for (const unsub of unsubs) unsub()
               return
             }
-            // 2) 历史 K 线快照（reqHistoricalData 一次性全量，内置超时；失败仅报错不影响实时流）
-            //    先于实时流推送：其最后一根同时作为实时聚合器的播种数据（同周期续接而非覆盖）
-            const history = adapter.getKlines(symbol, interval, 300)
-            void history
-              .then((rows) => {
-                if (client.readyState === client.OPEN) send({ type: 'hist', source: 'IBKR', symbol, interval, append: false, data: rows })
-              })
-              .catch((err) => send({ type: 'error', message: err instanceof Error ? err.message : 'IBKR 历史K线加载失败' }))
+            // 2) 历史 K 线：**仅作为实时聚合器的播种数据**（其最后一根与本周期续接），
+            //    不再向客户端推送整表 hist —— 历史由前端切换 symbol / interval 时经
+            //    REST /api/kline/history 预加载；两边走同一份 15s 缓存，因此不会重复请求 IBKR。
+            //    失败只记录日志，不影响实时流（前端已有历史时首根 open/volume 会略有缺失）。
+            const history = adapter.fetchHistoricalBars
+              ? adapter.fetchHistoricalBars(symbol, interval, HISTORY_BAR_LIMIT)
+              : adapter.getKlines(symbol, interval, HISTORY_BAR_LIMIT)
+            void history.catch((err) => {
+              logger.warn(`[IBKR] ${symbol} ${interval} 历史K线（播种用）加载失败: ${err instanceof Error ? err.message : String(err)}`)
+            })
             // 3) 实时 K 线流：5 秒实时 bar / 逐笔 tick → 聚合为 interval 周期 K 线（Unix 秒、按周期向下取整对齐）
             try {
               const unsubBar = await adapter.subscribeBar!(
@@ -154,19 +184,20 @@ export function attachMarketSocket(server: Server, manager = new MarketManager()
               for (const unsub of unsubs) unsub()
               return
             }
-            ibkrSubscriptions.set(symbol, () => { for (const unsub of unsubs) unsub() })
+            ibkrSubscriptions.set(subscriptionKey, () => { for (const unsub of unsubs) unsub() })
             send({ type: 'connected', source: 'IBKR', symbol, interval, dataType: 'tick' })
           })
           .catch((err) => {
+            if (ibkrRequestedKey === subscriptionKey) ibkrRequestedKey = null
             send({ type: 'error', message: err instanceof Error ? err.message : 'IBKR 数据源连接失败' })
           })
       } else if (action === 'unsubscribe') {
-        const unsub = ibkrSubscriptions.get(symbol)
-        if (unsub) {
-          unsub()
-          ibkrSubscriptions.delete(symbol)
-          send({ type: 'unsubscribed', source: 'IBKR', symbol })
-        }
+        // interval 可选：提供时只释放该周期，未提供时释放该标的的全部周期订阅
+        const hasInterval = msg.interval !== undefined && msg.interval !== null
+        const targetKey = `${symbol}|${interval}`
+        const existed = ibkrSubscriptions.has(targetKey) || [...ibkrSubscriptions.keys()].some((k) => k.startsWith(`${symbol}|`))
+        releaseIbkrSubscriptions(symbol, hasInterval ? interval : undefined)
+        if (existed) send({ type: 'unsubscribed', source: 'IBKR', symbol, interval })
       } else if (action === 'load_more_history') {
         // 分页拉取更早历史：endDateTime = 当前已加载 K 线最左侧的 Unix 时间戳（epoch ms），
         // 后端透传给 reqHistoricalData 的 endDateTime，返回更早一段数据并以 append 标记推送。
@@ -262,12 +293,14 @@ function createSubscription(
   const onError = (message: string) => send({ type: 'error', message })
   switch (dataType) {
     case 'kline':
-      // onKline 单根增量；onHist 全量批量（Tradovate hist，前端整表替换）
+      // onKline：单根增量；历史**不再由后端推送**（前端切换 symbol / interval 时经 REST
+      // /api/kline/history 预加载后再建订阅）。这里仍须传入 onHist —— Tradovate 在「无 onHist」时
+      // 会把整表 hist 逐根降级成数百条 kline 消息推送，因此用一个空回调显式吞掉历史批次。
       return adapter.subscribe(
         symbol,
         interval,
         (kline) => send({ type: 'kline', data: kline }),
-        (klines) => send({ type: 'hist', data: klines }),
+        () => { /* 历史由 REST 预加载，刻意不推送 */ },
         onError,
       )
     case 'quote':

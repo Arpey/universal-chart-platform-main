@@ -9,6 +9,7 @@ import {
   WhatToShow,
 } from '@stoqey/ib'
 import type { Contract, ContractDetails, TickType } from '@stoqey/ib'
+import { IBKR_BAR_SIZE, ibkrHistoryDuration } from '../core/intervals'
 import { config } from '../utils/config'
 import type { IBKRMarketDataTypeSetting } from '../utils/config'
 import { logger } from '../utils/logger'
@@ -66,15 +67,12 @@ const IBKR_ERROR_HINTS: Partial<Record<number, string>> = {
   10197: '与同一 IBKR 用户的另一实时会话冲突：请勿在本地 TWS 与服务器 IB Gateway 同时登录同一用户',
 }
 
-/** 各周期对应的 IBKR barSize（reqHistoricalData 用；实时 K 线改为逐笔 tick 聚合，不再使用上游 bar 周期）。 */
-const HISTORICAL_BAR_SIZE: Record<Interval, BarSizeSetting> = {
-  '1m': BarSizeSetting.MINUTES_ONE,
-  '5m': BarSizeSetting.MINUTES_FIVE,
-  '15m': BarSizeSetting.MINUTES_FIFTEEN,
-  '1h': BarSizeSetting.HOURS_ONE,
-  '4h': BarSizeSetting.HOURS_FOUR,
-  '1d': BarSizeSetting.DAYS_ONE,
-}
+/**
+ * 各周期对应的 IBKR barSize（reqHistoricalData 用；实时 K 线为逐笔 tick 聚合，不使用上游 bar 周期）。
+ * 唯一来源：`core/intervals.IBKR_BAR_SIZE`（'1 min' / '5 mins' / … 与 BarSizeSetting 枚举值一致），
+ * 前后端周期映射因此不会各写一份而出现「请求周期与实拉周期不一致」。
+ */
+const HISTORICAL_BAR_SIZE: Record<Interval, BarSizeSetting> = IBKR_BAR_SIZE as unknown as Record<Interval, BarSizeSetting>
 
 /** 配置字符串 → IB MarketDataType 数值（1=实时 2=冻结 3=延迟 4=延迟冻结）。 */
 const MARKET_DATA_TYPE_VALUES: Record<IBKRMarketDataTypeSetting, MarketDataType> = {
@@ -408,10 +406,11 @@ export class IBKRClient {
 
     const reqId = this.nextReqId++
     const barSize = HISTORICAL_BAR_SIZE[interval]
-    const durationStr = this.historicalDuration(interval, limit)
+    // durationStr 按「周期 + 需要根数」动态计算（下限保证 ≥ limit 根，上限封顶在 IBKR 各 barSize 允许的回看窗口内）
+    const durationStr = ibkrHistoryDuration(interval, limit)
     // 分页：endDateTime 为旧 K 线最左侧时间戳，转为 IBKR 格式；缺省为空串 = 当前时刻
     const endStr = typeof endDateTime === 'number' && Number.isFinite(endDateTime) && endDateTime > 0 ? formatIBDateTime(endDateTime) : ''
-    logger.info(`[IBKR] 请求历史K线: ${symbol} ${interval}（barSize=${barSize}, duration=${durationStr}, end=${endStr || 'now'}, reqId=${reqId}）`)
+    logger.info(`[IBKR] 请求历史K线: ${symbol} ${interval}（barSize=${barSize}, duration=${durationStr}, limit=${limit}, end=${endStr || 'now'}, reqId=${reqId}）`)
 
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -434,8 +433,9 @@ export class IBKRClient {
       })
       try {
         // whatToShow=TRADES、useRTH=0（全天 24h 电子盘，避免期货盘前盘后断层）、
-        // formatDate=1（标准 yyyyMMdd HH:mm:ss 时间格式）、keepUpToDate=false（一次性）
-        ib.reqHistoricalData(reqId, contract, endStr, durationStr, barSize, WhatToShow.TRADES, false, 1, false)
+        // formatDate=2（Unix 秒，时间戳不含时区歧义，跨 DST 也不会偏移）、
+        // keepUpToDate=false（一次性拉取）
+        ib.reqHistoricalData(reqId, contract, endStr, durationStr, barSize, WhatToShow.TRADES, false, 2, false)
       } catch (err) {
         clearTimeout(timer)
         this.historicalPending.delete(reqId)
@@ -513,25 +513,6 @@ export class IBKRClient {
         reject(err instanceof Error ? err : new Error(String(err)))
       }
     })
-  }
-
-  /**
-   * 依据周期与请求根数计算 reqHistoricalData 的 durationStr。
-   * 周期越短给越长的回看窗口（1m 至少 2 D，1h/1d 固定 1 M / 1 Y），
-   * 保证远期 K 线能一次性加载到，同时按 IBKR 官方 step-size 上限封顶。
-   */
-  private historicalDuration(interval: Interval, limit: number): string {
-    const minutesPerBar: Record<Interval, number> = { '1m': 1, '5m': 5, '15m': 15, '1h': 60, '4h': 240, '1d': 1440 }
-    // 25% 余量 → 换算成天数
-    const days = Math.ceil((minutesPerBar[interval] * Math.max(1, limit) * 1.25) / 1440)
-    switch (interval) {
-      case '1d': return '1 Y' // 日线 → 1 年
-      case '1h': return '1 M' // 1h → 1 个月（用户要求，720 根）
-      case '4h': return '1 M' // 4h → 1 个月
-      case '15m': return `${Math.max(4, days)} D` // 至少 4 天
-      case '5m': return `${Math.max(2, days)} D` // 至少 2 天
-      case '1m': return `${Math.max(2, days)} D` // 至少 2 天（用户要求）
-    }
   }
 
   /**
@@ -851,6 +832,18 @@ export class IBKRClient {
       this.connectionError = `${message}（ErrorCode=${code}${suffix}）`
       logger.warn(`[IBKR] 连接错误: ErrorCode=${code}${suffix} message=${message}`)
       this.emitStatus(false, err)
+      return
+    }
+    // 历史数据「无数据」类错误（162: HMDS query returned no data / No data of type TRADES…）：
+    // 这是「分页翻到数据尽头 / 该区间无成交」的正常结果，不是失败 —— 直接以**空数据集**结束该请求，
+    // 避免干等到 15s 超时（前端据此把 hasMore 置为 false，停止继续向左分页且不弹错误提示）。
+    const pendingHistorical = this.historicalPending.get(reqId)
+    // 注：ErrorCode 是「已知错误码字面量联合」类型，IB 的 162（历史数据无数据）不在其中，
+    // 因此先落到 number 再比较，避免 TS2367（无重叠比较）。
+    const codeNumber: number = code
+    if (pendingHistorical && (codeNumber === 162 || /no data/i.test(message))) {
+      logger.info(`[IBKR] 历史K线无数据(reqId=${reqId}, ErrorCode=${code}${suffix}): ${message}（按空数据集返回）`)
+      pendingHistorical.onDone(pendingHistorical.bars)
       return
     }
     logger.warn(`[IBKR] 行情错误(reqId=${reqId}, ErrorCode=${code}${suffix}): ${message}`)

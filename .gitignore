@@ -17,3 +17,5 @@ src/**/*.js.js
 .vite/
 
 test_tradovate.py
+pushOrder/state.json
+pushOrder/__pycache__/app.cpython-37.pyc

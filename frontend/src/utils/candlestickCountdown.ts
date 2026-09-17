@@ -1,22 +1,16 @@
-import type { Interval } from '../types'
-// 北京时间换算工具统一收敛在 utils/beijingTime.ts；此处仅做 API 兼容转发，
-// 旧调用方（useCountdown 等）无需改动即可继续使用既有导出。
 import { BEIJING_UTC_OFFSET_MS, formatBeijingClock, formatBeijingDate, formatBeijingDateTime, formatBeijingShort, toEpochMs, toEpochSeconds } from './beijingTime'
+// 周期 → 秒数唯一来源：constants/intervals（与后端 core/intervals.ts 对应），此处再导出保持既有调用方不变。
+import { intervalSeconds } from '../constants/intervals'
 export { BEIJING_UTC_OFFSET_MS, toEpochSeconds } from './beijingTime'
 export { formatBeijingClock, formatBeijingDate, formatBeijingDateTime, formatBeijingShort, toEpochMs } from './beijingTime'
+export { INTERVAL_SECONDS } from '../constants/intervals'
 
-/** 各 K 线周期对应的秒数。K 线边界严格对齐各数据源/交易所的真实结算点（epoch 网格），与浏览器本地时区无关。 */
-export const INTERVAL_SECONDS: Record<Interval, number> = {
-  '1m': 60,
-  '5m': 300,
-  '15m': 900,
-  '1h': 3600,
-  '4h': 14400,
-  '1d': 86400,
-}
-
+/**
+ * 各 K 线周期对应的秒数。K 线边界严格对齐各数据源/交易所的真实结算点（epoch 网格），与浏览器本地时区无关。
+ * 唯一来源见 constants/intervals.ts。
+ */
 export function intervalToSeconds(interval: string): number {
-  return INTERVAL_SECONDS[interval as Interval] ?? 60
+  return intervalSeconds(interval)
 }
 
 /**

@@ -49,6 +49,14 @@ export interface MarketAdapter {
 export interface MarketDataAdapter extends MarketAdapter {
   getSymbols(): Promise<SymbolInfo[]>
   getAllTickers(): Promise<Ticker[]>
+  /**
+   * 历史 K 线（REST 预加载：前端切换 symbol / interval 时先铺满最近 limit 根，再衔接实时流）。
+   * 统一契约：10 位 Unix 秒、按周期网格对齐、按 time 升序、同 time 去重（保留最后一条）、
+   * 只返回最近 limit 根；默认 limit = HISTORY_BAR_LIMIT（100）。
+   * @param endTime 分页边界（10 位 Unix 秒，可选）：只返回严格早于该时间的最近 limit 根（向左翻页）。
+   * 不支持历史的数据源实现为「返回空数组 + warn」，前端需容错（此时仅显示实时数据）。
+   */
+  fetchHistoricalBars?(symbol: string, interval: Interval, limit: number, endTime?: number): Promise<Kline[]>
   /** 连通性预检（Tradovate 鉴权校验；可选） */
   ping?(): Promise<void>
   /** 底层连接状态订阅（可选，IBKR 断线/重连时广播给 WebSocket 客户端） */

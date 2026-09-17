@@ -1,4 +1,5 @@
-import type { Kline } from '../types'
+import type { Interval, Kline } from '../types'
+import { intervalToSeconds } from './candlestickCountdown'
 import { toEpochSeconds } from './beijingTime'
 
 /**
@@ -26,12 +27,29 @@ function toFinite(value: unknown): number {
 }
 
 /**
+ * 把 K 线时间戳对齐到「当前周期网格」：`floor(time / step) * step`（step = 周期秒数）。
+ *
+ * 为什么需要：后端各数据源的历史 bar 起点并不保证落在同一网格上（典型：IBKR 的 4h bar 按交易所
+ * 会话时间对齐，与前端 UTC 4h 网格相差 2 小时），历史与实时混排时会出现「同周期却有两根 K 线」
+ * 或间距不均 → 图表错位 / 断点。统一对齐后，同周期的历史与实时 K 线会归并到同一根。
+ * 已对齐的数据是恒等变换（1m / 5m / 15m / 1h / 1d 不受影响）。
+ */
+export function alignKlineToInterval(kline: Kline, interval?: Interval | number): Kline {
+  const step = typeof interval === 'number' ? Math.floor(interval) : intervalToSeconds(String(interval ?? '1m'))
+  if (!Number.isFinite(step) || step < 1) return kline
+  const aligned = Math.floor(kline.time / step) * step
+  if (aligned <= 0 || aligned === kline.time) return kline
+  return { ...kline, time: aligned }
+}
+
+/**
  * 归一化单根 K 线：
- * - 时间戳统一为 10 位 Unix 秒（毫秒自动换算）；
+ * - 时间戳统一为 10 位 Unix 秒（毫秒自动换算，非数字 / <= 0 视为非法）；
  * - OHLC 转有限数并保证 high ≥ open/close ≥ low；volume 不为负；
+ * - 传入 interval 时把时间戳对齐到周期网格（见 alignKlineToInterval）；
  * - 非法行（无时间 / OHLC 非正）返回 null，由调用方丢弃。
  */
-export function normalizeKline(row: Kline | null | undefined): Kline | null {
+export function normalizeKline(row: Kline | null | undefined, interval?: Interval | number): Kline | null {
   if (!row) return null
   const time = toEpochSeconds(row.time)
   const open = toFinite(row.open)
@@ -39,7 +57,7 @@ export function normalizeKline(row: Kline | null | undefined): Kline | null {
   const low = toFinite(row.low)
   const close = toFinite(row.close)
   if (!time || !(open > 0) || !(high > 0) || !(low > 0) || !(close > 0)) return null
-  return {
+  const bar: Kline = {
     time,
     open,
     high: Math.max(high, open, close),
@@ -47,15 +65,22 @@ export function normalizeKline(row: Kline | null | undefined): Kline | null {
     close,
     volume: Math.max(0, toFinite(row.volume)),
   }
+  return interval === undefined ? bar : alignKlineToInterval(bar, interval)
 }
 
-/** 归一化整表：过滤非法行 → 同 time 去重（后者覆盖）→ 按 time 升序（满足 setData 的严格有序要求）。 */
-export function normalizeKlines(rows: readonly Kline[] | null | undefined): Kline[] {
+/**
+ * 归一化整表（图表 `setData()` 的唯一数据来源）：
+ * 1. 过滤非法行（time 非数字 / <= 0、OHLC 不合法）；
+ * 2. 相同 time 去重 —— **保留最后一条**（Map.set 按输入顺序覆盖），保证与后端最新快照一致；
+ * 3. 按 time 升序排序 —— 输出无重复、无乱序（lightweight-charts 要求严格升序）；
+ * 4. 传入 interval 时统一按周期网格对齐（避免历史 / 实时网格不一致导致的错位与断点）。
+ */
+export function normalizeKlines(rows: readonly Kline[] | null | undefined, interval?: Interval | number): Kline[] {
   if (!Array.isArray(rows)) return []
   const seen = new Map<number, Kline>()
   for (const row of rows) {
-    const kline = normalizeKline(row)
-    if (kline) seen.set(kline.time, kline)
+    const kline = normalizeKline(row, interval)
+    if (kline) seen.set(kline.time, kline) // 后者覆盖前者：同 time 保留最后一条
   }
   return [...seen.values()].sort((a, b) => a.time - b.time)
 }

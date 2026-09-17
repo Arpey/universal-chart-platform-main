@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   createChart,
   ColorType,
@@ -87,8 +87,12 @@ const props = defineProps<{
   magnet?: boolean
   stayInMode?: boolean
   clearSignal?: number
-  /** 图表滚动到最左侧已加载 K 线时回调（endTime = 最旧 bar 的 Unix 毫秒），用于 IBKR 分页加载更早历史。 */
-  onLoadMoreHistory?: (endTime: number) => void
+  /**
+   * 时间轴拖到最左侧时的分页回调（加载更早的 K 线，REST /api/kline/history&endTime=最早一根）。
+   * @returns 前置新增的根数（> 0 时图表按该数量补偿视口偏移，画面不跳动）；
+   *          0 = 没有更早的数据（此后不再触发）；null = 本次跳过（并发中 / 请求失败，可稍后重试）。
+   */
+  onLoadMoreHistory?: () => Promise<number | null>
 }>()
 
 const emit = defineEmits<{
@@ -156,6 +160,19 @@ let disposed = false
 let ro: ResizeObserver | null = null
 let loadMoreGuardTime = 0 // 已触发 load_more 的最旧 bar 时间（避免同一边界重复请求）
 let loadMoreGuardAt = 0 // 上次触发时间戳（节流，防止连续滚动时打爆后端）
+/** 是否还存在更早的 K 线（分页回调返回 0 后置 false，停止继续向左加载）。 */
+let paginationHasMore = true
+/** 分页请求进行中：避免同一时刻并发多页请求。 */
+let paginationLoading = false
+/**
+ * 是否已进入「用户主动交互」状态：初始 fitContent / 程序化视口设置同样会让 range.from ≈ 0，
+ * 若不区分就会在首屏自动加载更早历史（多余请求），因此只在用户滚动/拖拽/缩放后才允许分页。
+ */
+let paginationArmed = false
+/** 触发分页的左侧阈值（可见区间起点逻辑索引）：<= 10 视为「已拖到最左」。 */
+const LOAD_MORE_FROM_THRESHOLD = 10
+/** 分页节流间隔（毫秒）：拖动过程中最多每 2s 触发一次。 */
+const LOAD_MORE_THROTTLE_MS = 2000
 /** 当前已渲染的标的/数据源上下文（用于识别跨标的切换）。 */
 let prevScopeSymbol = props.symbol ?? ''
 let prevScopeDatasource = props.datasource ?? ''
@@ -412,6 +429,13 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   disposed = true
   window.removeEventListener('resize', handleResize)
+  const el = container.value
+  if (el) {
+    // 分页启用监听（与 bindInteraction 对应）
+    el.removeEventListener('wheel', armPagination)
+    el.removeEventListener('mousedown', armPagination)
+    el.removeEventListener('touchstart', armPagination)
+  }
   ro?.disconnect()
   // 清理 EMA 折线系列（chart.removeSeries 为 v5 的移除 API）
   for (const s of emaSeriesMap.values()) chart?.removeSeries(s)
@@ -449,7 +473,7 @@ function handleResize() {
  */
 function fullRefresh() {
   if (disposed || !candleSeries || !volumeSeries) return
-  const bars = normalizeKlines(props.data)
+  const bars = normalizeKlines(props.data, props.interval)
   candleSeries.setData(bars.map(toCandle))
   volumeSeries.setData(bars.map(toVolume))
   lastLen = props.data.length
@@ -538,9 +562,12 @@ function resetChartContext(clearDrawings: boolean) {
   lastLen = 0
   lastFirstTime = 0
   lastRenderedTime = 0
-  // 2) 分页守卫归零，避免新标的沿用旧标的的 load_more 去重边界
+  // 2) 分页守卫归零，避免新标的沿用旧标的的 load_more 去重边界；hasMore 等由 store 的 loadHistory 重新置位
   loadMoreGuardTime = 0
   loadMoreGuardAt = 0
+  paginationHasMore = true
+  paginationLoading = false
+  paginationArmed = false // 新标的/周期：等用户再次交互才允许向左分页
   // 3) EMA：旧标的数值失效，先清空渲染，待新数据经 syncEmaSeries 重算
   for (const s of emaSeriesMap.values()) s.setData([])
   emaTailMap.clear()
@@ -572,28 +599,62 @@ function toUTCTime(t: number): UTCTimestamp {
 }
 
 /**
- * 可见范围变化：当图表滚动到最左侧已加载 K 线时，回调 onLoadMoreHistory 触发分页拉取更早数据（IBKR）。
- * range.from 为可见区第一个 bar 的逻辑索引：<= 0 表示左边界已到达/越过最旧 bar。
+ * 可见范围变化：图表被拖到最左侧（range.from <= 阈值）时自动加载更早的 K 线（REST 分页）。
+ * 触发条件（全部满足）：用户已交互过、还有更早数据、无进行中的分页请求、同一边界未请求过、距上次触发超过节流间隔。
  */
 function onVisibleLogicalRangeChange(range: LogicalRange | null) {
   if (!range || disposed) return
   const bars = props.data
   if (!bars.length || typeof props.onLoadMoreHistory !== 'function') return
+  // 首屏 fitContent / 程序化视口 → 尚未交互，不触发分页
+  if (!paginationArmed) return
+  if (typeof range.from !== 'number' || range.from > LOAD_MORE_FROM_THRESHOLD) return
+  if (!paginationHasMore || paginationLoading) return
   const oldest = bars[0].time
-  if (typeof oldest !== 'number' || !Number.isFinite(oldest) || oldest <= 0) return
-  // 切换标的/周期后最旧 bar 变新 → 重置边界守卫
+  if (!Number.isFinite(oldest) || oldest <= 0) return
+  // 切换标的/周期后最旧 bar 变新 → 重置边界守卫（同一边界只请求一页）
   if (oldest > loadMoreGuardTime) loadMoreGuardTime = 0
   const now = Date.now()
-  if (
-    typeof range.from === 'number'
-    && range.from <= 0.5 // 左边界已滑到最左侧
-    && oldest !== loadMoreGuardTime // 同一边界只请求一次
-    && now - loadMoreGuardAt > 2000 // 节流
-  ) {
-    loadMoreGuardTime = oldest
-    loadMoreGuardAt = now
-    props.onLoadMoreHistory(oldest)
+  if (oldest === loadMoreGuardTime) return
+  if (now - loadMoreGuardAt < LOAD_MORE_THROTTLE_MS) return
+  loadMoreGuardTime = oldest
+  loadMoreGuardAt = now
+  void loadOlderBars()
+}
+
+/**
+ * 拉取更早一页并保持视口：分页数据是**前置插入**，setData 后整体右移「新增根数」，
+ * 用户看到的画面位置不变（否则新数据插入后视口会跳到最左侧）。
+ */
+async function loadOlderBars() {
+  const loader = props.onLoadMoreHistory
+  if (!chart || disposed || typeof loader !== 'function') return
+  // 记录加载前的可见逻辑区间（setData 前后索引基准一致：逻辑索引按 bar 序号）
+  const prev = chart.timeScale().getVisibleLogicalRange()
+  paginationLoading = true
+  try {
+    const added = await loader()
+    if (disposed || !chart) return
+    if (added === 0) {
+      // 上游没有更早的数据 → 停止继续向左分页
+      paginationHasMore = false
+      return
+    }
+    if (added === null || typeof added !== 'number' || added <= 0) return // 跳过/失败：保持 hasMore，稍后可重试
+    // 等 store → props.data → fullRefresh()（setData）落地后再补偿视口
+    await nextTick()
+    if (disposed || !chart || !prev) return
+    chart.timeScale().setVisibleLogicalRange({ from: prev.from + added, to: prev.to + added })
+  } catch (err) {
+    console.warn('[TradingChart] 加载更早 K 线失败', err)
+  } finally {
+    paginationLoading = false
   }
+}
+
+/** 用户首次与图表交互（滚轮 / 拖拽 / 触屏）后启用分页 —— 避免首屏自动加载更早历史。 */
+function armPagination() {
+  paginationArmed = true
 }
 
 /** 强制转为有限数值，避免后端返回字符串/NaN 导致图表异常 */
@@ -796,6 +857,10 @@ function bindInteraction() {
     el.addEventListener('dblclick', handleDblClick)
     // 右键快捷下单：需要图表的物理坐标 → 价格 / 时间
     el.addEventListener('contextmenu', handleContextMenu)
+    // 分页启用：用户滚动 / 拖拽 / 触屏后才允许向左加载更早历史（见 armPagination）
+    el.addEventListener('wheel', armPagination, { passive: true })
+    el.addEventListener('mousedown', armPagination)
+    el.addEventListener('touchstart', armPagination, { passive: true })
   }
   document.addEventListener('mousemove', handleDocMove)
   document.addEventListener('mouseup', handleMouseUp)

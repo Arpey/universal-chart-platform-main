@@ -11,7 +11,7 @@ import DataSourceSwitcher from './components/DataSourceSwitcher.vue'
 import TradingPanel from './components/trading/TradingPanel.vue'
 import { useMarketStore } from './stores/marketStore'
 import { useTradingStore } from './stores/tradingStore'
-import { connectMarket, connectIBKR, type WsDataType, type IBKRConnection } from './services/wsService'
+import { connectMarket, connectIBKR, type WsDataType } from './services/wsService'
 import { useCountdown } from './composables/useCountdown'
 import type { MarketView } from './types'
 import type { DrawKind } from './types/drawing'
@@ -29,13 +29,6 @@ const activeTool = ref<DrawKind>('cursor')
 const clearSignal = ref(0)
 const toolActive = ref(false)
 let disconnect = () => {}
-/** 当前 IBKR 控制通道连接（用于分页加载更早历史 K 线）。 */
-const ibkrConnection = ref<IBKRConnection | null>(null)
-
-/** IBKR 分页：图表滚动到最左侧时，以最旧 bar 时间戳向后端请求更早历史。 */
-function loadMoreIBKRHistory(endTime: number) {
-  ibkrConnection.value?.loadMoreHistory(endTime)
-}
 
 /** 顶部/状态栏数据源标签：Tradovate / IBKR / Tradefi 分类 / Binance。 */
 const currentSourceLabel = computed(() => {
@@ -136,9 +129,14 @@ function clearDrawings() {
   clearSignal.value++
 }
 
-function refresh() {
-  disconnect()
-  // IBKR：消息驱动订阅（控制通道连接后发送 get_symbols / subscribe JSON 消息），不走 URL 参数流
+/**
+ * 建立实时订阅（在历史渲染完成后调用；disconnect 由 refresh 统一负责）。
+ * - IBKR：消息驱动订阅（控制通道连接后发送 get_symbols / subscribe JSON 消息），不走 URL 参数流；
+ * - 其它数据源：URL 参数流（dataType 由当前视图决定）。
+ * 历史已由 REST 预加载，故这里不再依赖后端推送的历史；
+ * 实时 K 线由 store.update 按「< 边界丢弃 / === 边界覆盖 / > 边界追加」与历史衔接。
+ */
+function subscribeRealtime() {
   if (market.datasource === 'ibkr') {
     const conn = connectIBKR({
       symbol: market.symbol,
@@ -152,11 +150,9 @@ function refresh() {
       onState: (value) => { connected.value = value },
       onError: (message) => { market.error = message },
     })
-    ibkrConnection.value = conn
     disconnect = conn.disconnect
     return
   }
-  void market.load()
   disconnect = connectMarket(market.symbol, market.interval, {
     source: market.datasource,
     dataType: viewDataTypes[market.view],
@@ -169,19 +165,54 @@ function refresh() {
   }).disconnect
 }
 
+/** 流程序号：快速连续切换时，过期的历史请求 / 订阅会被直接放弃，避免旧品种数据写回图表。 */
+let refreshSeq = 0
+
+/**
+ * 切换 symbol / interval / 数据源（或视图）时的完整加载流程（TradingView 风格）：
+ * 1. 先取消旧的 WebSocket 订阅（带 symbol+interval 标识，后端据此 dispose 旧周期聚合器）；
+ * 2. 清空旧图表序列（clearMarketData → 图表 props.data=[] → series.setData([])），避免残留上一品种/周期；
+ * 3. 发起 REST 历史请求（GET /api/kline/history，最近 HISTORY_BAR_LIMIT=100 根）→ 归一化 → setData 渲染，
+ *    并记录 lastHistoricalTime 作为实时衔接边界；
+ * 4. 历史渲染完成后才建立实时订阅，实时数据按衔接规则 update / append。
+ */
+async function refresh(scopeChanged: boolean) {
+  const seq = ++refreshSeq
+  // 1) 取消旧订阅（幂等；旧连接关闭后后端清理旧周期聚合器）
+  disconnect()
+  disconnect = () => {}
+  // 2) 标的 / 周期 / 数据源变化 → 清空旧序列与行情快照（图表立即 setData([])，不残留上一品种/周期）
+  if (scopeChanged) market.clearMarketData()
+  // 3) 历史优先：仅「范围变化 + K 线视图」需要预热历史（盘口 / Tick 视图没有 K 线）
+  if (scopeChanged && market.view === 'candlestick') {
+    await market.loadHistory()
+    if (seq !== refreshSeq) return // 加载期间又切换了 symbol / interval → 放弃本次订阅
+  }
+  // 顶栏行情快照（非阻塞，失败静默）
+  if (scopeChanged) void market.loadTicker()
+  // 4) 历史渲染完成后建立实时订阅
+  subscribeRealtime()
+}
+
+/** 历史加载失败后的重试（重新走完整流程：清空 → 拉历史 → 订阅），不会残留半截数据。 */
+function retryHistory() {
+  void refresh(true)
+}
+
 // 标的 / 周期 / 数据源 / 视图任一变化都重建订阅；
-// 其中 标的/周期/数据源 变化时先清空旧标的快照，避免图表、价格与倒计时沿用旧坐标
+// 其中 标的/周期/数据源 变化走「清空旧数据 → 加载最近 100 根历史 → 再订阅实时」的完整流程，
+// 仅视图变化（K线 ↔ 盘口 ↔ Tick）只重建订阅、不重复拉历史。
 watch(
   () => [market.symbol, market.interval, market.datasource, market.view],
   ([sym, iv, src], [oSym, oIv, oSrc]) => {
-    if (sym !== oSym || iv !== oIv || src !== oSrc) market.clearMarketData()
-    refresh()
+    void refresh(sym !== oSym || iv !== oIv || src !== oSrc)
   },
 )
 onMounted(async () => {
   await market.loadUniverse()
-  refresh()
+  void refresh(true)
 })
+
 onBeforeUnmount(() => disconnect())
 
 function formatPrice(value?: number) {
@@ -275,12 +306,20 @@ function openQuickOrder(preset: OrderPreset) {
 
       <!-- 主图区 -->
       <div class="panel">
+        <!-- 加载中：历史 K 线（最近 100 根）拉取中，渲染完成后才建立实时订阅 -->
+        <div v-if="market.loading && market.view === 'candlestick'" class="chart-loading">
+          <span class="spinner"></span>
+          <span>正在加载 {{ market.symbol }} · {{ market.interval }} 历史 K 线…</span>
+        </div>
         <div v-if="market.error" class="error">
           ⚠️ {{ market.error }}。请确认后端已启动或检查网络/代理配置。
+          <button class="retry-btn" title="重新加载历史 K 线并重建实时订阅" @click="retryHistory">重试</button>
         </div>
         <div v-if="toolActive" class="tool-hint">
           {{ TOOL_HINTS[activeTool] ?? '点击图表开始绘制' }} · 双击锚点删除 · Esc 取消
         </div>
+        <!-- 分页加载指示：时间轴拖到最左侧时正在拉取更早的 K 线 -->
+        <div v-if="market.historyLoading" class="history-loading">↺ 正在加载更早的 K 线…</div>
         <TradingChart
           v-if="market.view === 'candlestick'"
           :data="market.klines"
@@ -292,7 +331,7 @@ function openQuickOrder(preset: OrderPreset) {
           :magnet="magnet"
           :stay-in-mode="stayInMode"
           :clear-signal="clearSignal"
-          :on-load-more-history="market.datasource === 'ibkr' ? loadMoreIBKRHistory : undefined"
+          :on-load-more-history="market.loadMoreHistory"
           @tool-state="toolActive = $event"
           @drawing-done="onDrawingDone"
           @open-order="openQuickOrder"
@@ -515,6 +554,33 @@ function openQuickOrder(preset: OrderPreset) {
 .error {
   position: absolute; top: 8px; left: 8px; right: 8px; z-index: 5;
   padding: 8px 12px; background: #7f1d1d; color: #fecaca; font-size: 12px; border-radius: 6px;
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+}
+/* 历史 K 线加载指示（spinner）：切换 symbol / interval 时覆盖在图表上，避免误判为卡死 */
+.chart-loading {
+  position: absolute; inset: 0; z-index: 6;
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  background: rgba(0, 0, 0, 0.45); color: var(--color-text);
+  font-size: 12px; pointer-events: none;
+}
+.spinner {
+  width: 16px; height: 16px; border-radius: 50%;
+  border: 2px solid rgba(59, 130, 246, 0.25); border-top-color: #3b82f6;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.retry-btn {
+  margin-left: auto; padding: 3px 10px; font-size: 12px; cursor: pointer;
+  background: rgba(255, 255, 255, 0.14); color: inherit;
+  border: 1px solid rgba(255, 255, 255, 0.35); border-radius: 4px;
+}
+.retry-btn:hover { background: rgba(255, 255, 255, 0.26); }
+/* 分页加载指示（左上角小字）：时间轴拖到最左侧拉取更早 K 线时显示 */
+.history-loading {
+  position: absolute; left: 8px; bottom: 8px; z-index: 6;
+  padding: 3px 10px; border-radius: 5px;
+  background: rgba(0, 0, 0, 0.55); border: 1px solid var(--color-border);
+  color: var(--color-text-muted); font-size: 11px; pointer-events: none;
 }
 .tool-hint {
   position: absolute; top: 8px; left: 50%; transform: translateX(-50%); z-index: 5;

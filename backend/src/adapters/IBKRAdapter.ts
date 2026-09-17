@@ -1,7 +1,8 @@
 import { BaseAdapter } from './BaseAdapter'
 import { getIBKRClient, IBKR_CME_SYMBOLS } from '../services/IBKRClient'
 import type { IBKRClient, IBKRStatus } from '../services/IBKRClient'
-import { KlineAggregator, toEpochMs, toEpochSeconds } from '../core/KlineAggregator'
+import { KlineAggregator, aggregateBars, normalizeBars, toEpochMs, toEpochSeconds } from '../core/KlineAggregator'
+import { HISTORY_BAR_LIMIT } from '../core/intervals'
 import type { MarketDataAdapter, SymbolInfo } from '../types/adapter'
 import type { Interval, Kline, KlineSeed } from '../types/kline'
 import type { Ticker } from '../types/market'
@@ -34,6 +35,17 @@ type KlineFeed = 'bar' | 'tick'
 export class IBKRAdapter extends BaseAdapter implements MarketDataAdapter {
   /** 全局唯一 IBKRClient（单例）：绝不在此 new，避免向 TWS 注册额外的 API 客户端 */
   private readonly client: IBKRClient = getIBKRClient()
+
+  /**
+   * 实时 K 线聚合器缓存：key = `${symbol}|${interval}`，value = 聚合器 + 引用计数。
+   *
+   * 必须按 **标的 + 周期** 维度隔离：
+   * - 周期切换（同一标的新 interval）时旧聚合器必须 `dispose()` 并从缓存移除 ——
+   *   否则旧周期实例会继续用旧步长把 K 线推给图表，表现为「换周期后断点 / 时间戳跳跃 / 错位」；
+   * - refs 归零即释放，保证「新周期 → 新实例（新 step）」，不会复用旧周期状态；
+   * - 同一 symbol+interval 的并发订阅（多个 WS 客户端）共享同一实例（refs 计数）。
+   */
+  private readonly aggregators = new Map<string, { aggregator: KlineAggregator; refs: number }>()
 
   /** 连通性预检：等待 IB Gateway / TWS 连接就绪（复用全局唯一连接，不会新建连接）。 */
   ping(): Promise<void> {
@@ -74,6 +86,37 @@ export class IBKRAdapter extends BaseAdapter implements MarketDataAdapter {
   }
 
   /**
+   * 历史 K 线原始拉取（BaseAdapter.fetchHistoricalBars 的钩子）：
+   * IBKR 对 4h bar 的单次历史请求上限较小（实测约 90 根，`durationStr` 放大也无效），
+   * 因此 4h 不足 limit 根时改用 1h 数据按 4h 网格聚合补齐（见 aggregateBars），
+   * 保证「切换周期后先铺满最近 100 根」这一行为在 4h 同样成立；
+   * 聚合网格与实时 KlineAggregator 完全一致，所以历史末根与实时首根仍能无缝衔接。
+   */
+  protected override async loadHistoricalBars(symbol: string, interval: Interval, limit: number, endTime?: number): Promise<Kline[]> {
+    // limit 已由 BaseAdapter.fetchHistoricalBars 放大 50%（对齐/去重会合并部分 bar）
+    // endTime（10 位 Unix 秒）→ getKlines 的 endDateTime（IBKRClient 内部转毫秒并格式化为
+    // yyyyMMdd-HH:mm:ss UTC，等价于文档要求的 endDateTime 字符串）→ reqHistoricalData 取该时间之前的数据
+    const rows = await this.getKlines(symbol, interval, limit, endTime)
+    if (interval !== '4h') return rows
+    // 4h：IBKR 单次请求上限约 100 根，且其 4h bar 按交易所会话时间对齐 —— 归一到 UTC 4h 网格后会
+    // 合并掉一部分（实测 100 → 90），因此按「网格化后的真实根数」判断是否需要补齐。
+    const aligned = normalizeBars(rows, Number.MAX_SAFE_INTEGER, interval)
+    if (aligned.length >= limit) return rows
+    try {
+      // 1h 请求同样走 fetchHistoricalBars → 命中同一份 15s 缓存，不会重复打 IBKR；分页边界一并透传
+      const finer = await this.fetchHistoricalBars(symbol, '1h', limit * 4, endTime)
+      const aggregated = aggregateBars(finer, interval, limit)
+      if (aggregated.length > aligned.length) {
+        logger.info(`[IBKR] ${symbol} 4h 历史网格化后仅 ${aligned.length} 根，已用 1h 数据按 4h 网格聚合补齐至 ${aggregated.length} 根`)
+        return aggregated
+      }
+    } catch (err) {
+      logger.warn(`[IBKR] ${symbol} 4h 历史补齐失败（沿用上游原始 ${rows.length} 根）: ${err instanceof Error ? err.message : String(err)}`)
+    }
+    return rows
+  }
+
+  /**
    * K 线订阅（与 URL 参数流的 kline 协议兼容）：
    * - onHist：reqHistoricalData 一次性全量历史（300 根，时间戳为 Unix 秒）；
    * - onKline：实时增量 —— 由 subscribeBar 把 5 秒实时 bar / 逐笔 tick 聚合为当前周期 K 线（Unix 秒、按周期对齐）。
@@ -88,8 +131,9 @@ export class IBKRAdapter extends BaseAdapter implements MarketDataAdapter {
   ): () => void {
     let disposed = false
     let cancel: (() => void) | null = null
-    // 历史快照（内置超时，失败仅回调 onError）
-    const history = this.getKlines(symbol, interval, 300)
+    // 历史快照：统一走 fetchHistoricalBars（10 位 Unix 秒 + 升序 + 去重 + 只取最近 HISTORY_BAR_LIMIT 根），
+    // 与 REST /api/kline/history、实时订阅播种共享同一份 15s 缓存，快速切换不会重复请求上游
+    const history = this.fetchHistoricalBars(symbol, interval, HISTORY_BAR_LIMIT)
     void history
       .then((rows) => { if (!disposed) onHist?.(rows) })
       .catch((err) => { if (!disposed) onError?.(err instanceof Error ? err.message : String(err)) })
@@ -168,7 +212,13 @@ export class IBKRAdapter extends BaseAdapter implements MarketDataAdapter {
       return () => {}
     }
 
-    const aggregator = new KlineAggregator(interval)
+    const cacheKey = `${symbol}|${interval}`
+    const cached = this.aggregators.get(cacheKey)
+    // 同 symbol+interval 已有实例（多客户端并发订阅）→ 复用并累加引用；否则新建（step 与新周期一致）
+    const isNewAggregator = !cached
+    const aggregator = cached?.aggregator ?? new KlineAggregator(interval, { symbol })
+    if (cached) cached.refs += 1
+    else this.aggregators.set(cacheKey, { aggregator, refs: 1 })
     // 上游数据源恒为逐笔 tick：不再根据 marketDataType 分流到 5 秒 bar 通路
     let feed: KlineFeed = 'tick'
 
@@ -182,8 +232,9 @@ export class IBKRAdapter extends BaseAdapter implements MarketDataAdapter {
       }
     }
 
-    // 历史播种：异步到达也不算晚 —— 与已合成的同周期 K 线合并（open 取历史、volume 相加）
-    if (seed) {
+    // 历史播种：异步到达也不算晚 —— 与已合成的同周期 K 线合并（open 取历史、volume 相加）。
+    // 只在「新建聚合器」时播种：共享同一实例的并发订阅重复播种会把历史 volume 重复累加。
+    if (seed && isNewAggregator) {
       void Promise.resolve(seed)
         .then((row) => { if (row) emit(aggregator.seed(row)) })
         .catch(() => { /* 历史不可用：仅影响首根 K 线的 open / volume 完整性 */ })
@@ -197,11 +248,20 @@ export class IBKRAdapter extends BaseAdapter implements MarketDataAdapter {
       emit(aggregator.push({ price: tick.price, size: tick.size, timestamp: tick.timestamp }))
     })
 
-    // 取消订阅：只清理 tick 监听 + 上游行情订阅（5 秒 bar 通路已移除，无任何定时器/看门狗残留）
+    // 取消订阅：只清理 tick 监听 + 上游行情订阅（5 秒 bar 通路已移除，无任何定时器/看门狗残留）；
+    // 同时释放本订阅对应的聚合器（refs 归零 → dispose + 移出缓存），保证切换周期时旧周期实例彻底失效。
     return () => {
+      if (disposed) return // 幂等：重复调用不会把 refs 减成负数
       disposed = true
       unsubscribeTick()
       unsubscribeClient?.()
+      const entry = this.aggregators.get(cacheKey)
+      if (!entry) return
+      entry.refs -= 1
+      if (entry.refs <= 0) {
+        entry.aggregator.dispose()
+        this.aggregators.delete(cacheKey)
+      }
     }
   }
 

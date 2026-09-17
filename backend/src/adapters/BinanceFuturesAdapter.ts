@@ -93,9 +93,11 @@ export class BinanceFuturesAdapter extends BaseAdapter implements MarketDataAdap
   private symbolsCache: { data: SymbolInfo[]; at: number } | null = null
   private tickersCache: { data: Ticker[]; at: number } | null = null
 
-  async getKlines(symbol: string, interval: Interval, limit = 300): Promise<Kline[]> {
+  async getKlines(symbol: string, interval: Interval, limit = 300, endTime?: number): Promise<Kline[]> {
     this.assertAllowed(symbol)
-    const url = `${config.futuresBaseUrl}/fapi/v1/klines?symbol=${symbol.toUpperCase()}&interval=${interval}&limit=${limit}`
+    // endTime（10 位 Unix 秒，可选）：分页边界 —— 只取该时间之前的 K 线（币安 REST 参数为毫秒）
+    const endQuery = Number.isFinite(endTime) && (endTime ?? 0) > 0 ? `&endTime=${Math.floor(endTime as number) * 1000}` : ''
+    const url = `${config.futuresBaseUrl}/fapi/v1/klines?symbol=${symbol.toUpperCase()}&interval=${interval}&limit=${limit}${endQuery}`
     const rows = await this.requestJson<unknown[][]>(url, `Binance Futures klines(${symbol})`)
     // 币安 REST 数组格式 → 项目统一 Kline：毫秒时间戳换算为秒（与全项目/lightweight-charts 一致）
     return rows.map((row) => ({
