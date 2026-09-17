@@ -9,6 +9,7 @@ import StatusBar from './components/StatusBar.vue'
 import IndicatorsModal from './components/IndicatorsModal.vue'
 import DataSourceSwitcher from './components/DataSourceSwitcher.vue'
 import TradingPanel from './components/trading/TradingPanel.vue'
+import DirectOrderPanel from './components/trading/DirectOrderPanel.vue'
 import { useMarketStore } from './stores/marketStore'
 import { useTradingStore } from './stores/tradingStore'
 import { connectMarket, connectIBKR, type WsDataType } from './services/wsService'
@@ -304,49 +305,52 @@ function openQuickOrder(preset: OrderPreset) {
         <button class="tool danger" title="清除全部画线" @click="clearDrawings">✕</button>
       </aside>
 
-      <!-- 主图区 -->
-      <div class="panel">
-        <!-- 加载中：历史 K 线（最近 100 根）拉取中，渲染完成后才建立实时订阅 -->
-        <div v-if="market.loading && market.view === 'candlestick'" class="chart-loading">
-          <span class="spinner"></span>
-          <span>正在加载 {{ market.symbol }} · {{ market.interval }} 历史 K 线…</span>
+      <!-- 主图区（上方为 Tradovate 直连下单条，下方为 K线/盘口/Tick 视图） -->
+      <div class="main-column">
+        <DirectOrderPanel />
+        <div class="panel">
+          <!-- 加载中：历史 K 线（最近 100 根）拉取中，渲染完成后才建立实时订阅 -->
+          <div v-if="market.loading && market.view === 'candlestick'" class="chart-loading">
+            <span class="spinner"></span>
+            <span>正在加载 {{ market.symbol }} · {{ market.interval }} 历史 K 线…</span>
+          </div>
+          <div v-if="market.error" class="error">
+            ⚠️ {{ market.error }}。请确认后端已启动或检查网络/代理配置。
+            <button class="retry-btn" title="重新加载历史 K 线并重建实时订阅" @click="retryHistory">重试</button>
+          </div>
+          <div v-if="toolActive" class="tool-hint">
+            {{ TOOL_HINTS[activeTool] ?? '点击图表开始绘制' }} · 双击锚点删除 · Esc 取消
+          </div>
+          <!-- 分页加载指示：时间轴拖到最左侧时正在拉取更早的 K 线 -->
+          <div v-if="market.historyLoading" class="history-loading">↺ 正在加载更早的 K 线…</div>
+          <TradingChart
+            v-if="market.view === 'candlestick'"
+            :data="market.klines"
+            :update-signal="market.klineVersion"
+            :interval="market.interval"
+            :symbol="market.symbol"
+            :datasource="market.datasource"
+            :active-tool="activeTool"
+            :magnet="magnet"
+            :stay-in-mode="stayInMode"
+            :clear-signal="clearSignal"
+            :on-load-more-history="market.loadMoreHistory"
+            @tool-state="toolActive = $event"
+            @drawing-done="onDrawingDone"
+            @open-order="openQuickOrder"
+          />
+          <DepthPanel
+            v-else-if="market.view === 'dom'"
+            :dom="market.dom"
+            :quote="market.quote"
+            :symbol="market.symbol"
+          />
+          <TradeTape
+            v-else
+            :trades="market.trades"
+            :symbol="market.symbol"
+          />
         </div>
-        <div v-if="market.error" class="error">
-          ⚠️ {{ market.error }}。请确认后端已启动或检查网络/代理配置。
-          <button class="retry-btn" title="重新加载历史 K 线并重建实时订阅" @click="retryHistory">重试</button>
-        </div>
-        <div v-if="toolActive" class="tool-hint">
-          {{ TOOL_HINTS[activeTool] ?? '点击图表开始绘制' }} · 双击锚点删除 · Esc 取消
-        </div>
-        <!-- 分页加载指示：时间轴拖到最左侧时正在拉取更早的 K 线 -->
-        <div v-if="market.historyLoading" class="history-loading">↺ 正在加载更早的 K 线…</div>
-        <TradingChart
-          v-if="market.view === 'candlestick'"
-          :data="market.klines"
-          :update-signal="market.klineVersion"
-          :interval="market.interval"
-          :symbol="market.symbol"
-          :datasource="market.datasource"
-          :active-tool="activeTool"
-          :magnet="magnet"
-          :stay-in-mode="stayInMode"
-          :clear-signal="clearSignal"
-          :on-load-more-history="market.loadMoreHistory"
-          @tool-state="toolActive = $event"
-          @drawing-done="onDrawingDone"
-          @open-order="openQuickOrder"
-        />
-        <DepthPanel
-          v-else-if="market.view === 'dom'"
-          :dom="market.dom"
-          :quote="market.quote"
-          :symbol="market.symbol"
-        />
-        <TradeTape
-          v-else
-          :trades="market.trades"
-          :symbol="market.symbol"
-        />
       </div>
       <Watchlist />
     </section>
@@ -549,8 +553,16 @@ function openQuickOrder(preset: OrderPreset) {
 .tool.danger { margin-top: 6px; color: #ef534f; font-size: 13px; }
 .tool.danger:hover { background: rgba(239, 83, 79, 0.15); }
 
+/* 主图列：上方为 Tradovate 直连下单条，下方为主图（K线 / 盘口 / Tick） */
+.main-column {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 /* 主图区 */
-.panel { flex: 1; min-width: 0; position: relative; background: var(--color-bg-primary); }
+.panel { flex: 1; min-height: 0; min-width: 0; position: relative; background: var(--color-bg-primary); }
 .error {
   position: absolute; top: 8px; left: 8px; right: 8px; z-index: 5;
   padding: 8px 12px; background: #7f1d1d; color: #fecaca; font-size: 12px; border-radius: 6px;
