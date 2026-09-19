@@ -1,22 +1,26 @@
 """
 app.py
-Tradovate Executor - 方案 B 修复版
+Tradovate Executor - 完整修复版
 - 手动登录 + Token 捕获
-- 修复 _api_call: 只有 401/403 才换 token
-- 合约查询改用 /contract/suggest
-- 新增 /debug-contract 诊断接口
+- _api_call 处理 status=0（网络错误）
+- 全局异常处理器，防止 ASGI 崩溃
+- /account-summary 缓存 + 并发
+- 合约解析用 /contract/suggest
 """
 
 import os
 import asyncio
 import httpx
 import logging
+import traceback
 from typing import Optional, Dict, Any, List
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
+# ================= 配置 =================
 TRADOVATE_USER = os.environ.get("TRADOVATE_USER", "")
 TRADOVATE_PASS = os.environ.get("TRADOVATE_PASS", "")
 TRADOVATE_URL = "https://trader.tradovate.com/"
@@ -29,9 +33,17 @@ HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("tradovate")
 
-app = FastAPI(title="Tradovate Executor", version="2.2")
+app = FastAPI(title="Tradovate Executor", version="2.3")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+
+@app.exception_handler(Exception)
+async def _unhandled_exception(request, exc):
+    logger.error(f"未处理异常: {exc}\n{traceback.format_exc()}")
+    return JSONResponse(status_code=500, content={"detail": str(exc)})
+
+
+# ================= 全局状态 =================
 playwright_instance = None
 browser_instance: Optional[Browser] = None
 context_instance: Optional[BrowserContext] = None
@@ -42,11 +54,18 @@ _token_candidates: List[str] = []
 _current_token: str = ""
 _account_info: Dict[str, Any] = {}
 
+# 账户缓存
+_acct_cache: Dict[str, Any] = {"data": None, "ts": 0}
+_ACCT_TTL = 2  # 秒
+
+# 合约缓存
+_contract_cache: Dict[str, Dict[str, Any]] = {}
+
 TRADE_API_HINTS = ["/account/", "/order/", "/position/", "/cashBalance/", "/contract/", "/user/"]
 
 
+# ================= Token 捕获 =================
 async def _capture_auth(request):
-    """捕获所有带 Bearer 的请求"""
     global _current_token
     try:
         if "tradovateapi.com" not in request.url:
@@ -67,6 +86,7 @@ async def _capture_auth(request):
         pass
 
 
+# ================= API 调用 =================
 async def _try_token(method: str, url: str, token: str, payload: dict = None):
     """用指定 token 调一次 API，返回 (ok, status, data)"""
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
@@ -93,7 +113,9 @@ async def _try_token(method: str, url: str, token: str, payload: dict = None):
 async def _api_call(method: str, path: str, payload: dict = None) -> Any:
     """
     遍历所有候选 token，找到能用的那个。
-    关键修复：只有 401/403 才换 token 重试；其他 4xx 直接抛错。
+    - status=0（网络错误）：记录后继续尝试下一个 token
+    - 401/403：换 token 重试
+    - 其他 4xx/5xx：直接抛出
     """
     global _current_token
 
@@ -110,6 +132,7 @@ async def _api_call(method: str, path: str, payload: dict = None) -> Any:
             candidates.append(t)
 
     last_status = 0
+    last_error = ""
     for token in candidates:
         ok, status, data = await _try_token(method, url, token, payload)
         if ok:
@@ -118,19 +141,26 @@ async def _api_call(method: str, path: str, payload: dict = None) -> Any:
                 logger.info(f"✅ Token 切换为 (长度={len(token)})")
             return data
 
-        # 只有认证失败才换 token
+        # 网络错误
+        if status == 0:
+            last_error = str(data) or "连接失败"
+            continue
+
+        # 认证失败，换 token
         if status in (401, 403):
             last_status = status
             continue
 
-        # 其他错误（404、400、500 等）直接抛出
+        # 其他合法错误，直接抛
         raise HTTPException(status, f"API 错误 [{status}]: {data}")
 
+    if last_error:
+        raise HTTPException(502, f"网络错误: {last_error}")
     raise HTTPException(401, f"所有 Token 均失效 (最后状态码: {last_status})")
 
 
+# ================= 登录流程 =================
 async def wait_for_login_and_token(timeout_sec: int = 300) -> bool:
-    """等待用户完成登录 + 捕获有效 token"""
     logger.info("=" * 60)
     logger.info("📌 请在弹出的浏览器中手动登录 Tradovate")
     logger.info("   1. 输入用户名密码（含 2FA）")
@@ -164,7 +194,6 @@ async def wait_for_login_and_token(timeout_sec: int = 300) -> bool:
 
 
 async def auto_fill_form():
-    """如果设置了用户名密码，自动填写表单"""
     if not (TRADOVATE_USER and TRADOVATE_PASS):
         return
     try:
@@ -190,6 +219,7 @@ async def auto_fill_form():
         logger.warning(f"⚠️ 自动填写失败: {e}")
 
 
+# ================= 账户 & 合约 =================
 async def refresh_account_info():
     global _account_info
     try:
@@ -209,34 +239,35 @@ async def refresh_account_info():
 
 
 async def resolve_contract(symbol: str) -> Dict[str, Any]:
-    """
-    把用户输入的品种（如 MES）解析为具体合约（如 MESZ5）。
-    优先用 /contract/suggest 模糊搜索，失败则用 /contract/find 精确查找。
-    """
+    """把用户输入的品种（如 MES）解析为具体合约（如 MESZ6）"""
     symbol = symbol.upper().strip()
+
+    if symbol in _contract_cache:
+        return _contract_cache[symbol]
 
     # 方式 1: suggest 模糊搜索
     try:
         suggestions = await _api_call("GET", f"/contract/suggest?t={symbol}&l=10")
         if suggestions and isinstance(suggestions, list):
-            # 优先取名字以 symbol 开头的
             for c in suggestions:
                 name = (c.get("name") or "").upper()
                 if name.startswith(symbol):
                     logger.info(f"🔍 suggest: {symbol} → {c.get('name')} (id={c.get('id')})")
+                    _contract_cache[symbol] = c
                     return c
-            # 没匹配前缀就用第一个
             first = suggestions[0]
-            logger.info(f"🔍 suggest 兜底: {symbol} → {first.get('name')} (id={first.get('id')})")
+            logger.info(f"🔍 suggest 兜底: {symbol} → {first.get('name')}")
+            _contract_cache[symbol] = first
             return first
     except HTTPException as e:
-        logger.warning(f"⚠️ suggest 失败: {e.detail}，尝试 find")
+        logger.warning(f"⚠️ suggest 失败: {e.detail}")
 
     # 方式 2: find 精确查找
     try:
         contract = await _api_call("GET", f"/contract/find?name={symbol}")
         if contract and contract.get("id"):
-            logger.info(f"🔍 find: {symbol} → {contract.get('name')} (id={contract.get('id')})")
+            logger.info(f"🔍 find: {symbol} → {contract.get('name')}")
+            _contract_cache[symbol] = contract
             return contract
     except HTTPException as e:
         logger.warning(f"⚠️ find 失败: {e.detail}")
@@ -244,6 +275,7 @@ async def resolve_contract(symbol: str) -> Dict[str, Any]:
     raise HTTPException(404, f"找不到合约 {symbol}")
 
 
+# ================= 生命周期 =================
 @app.on_event("startup")
 async def startup_event():
     global playwright_instance, browser_instance, context_instance, page_instance
@@ -283,6 +315,7 @@ async def shutdown_event():
                 pass
 
 
+# ================= 请求模型 =================
 class OrderSignal(BaseModel):
     action: str
     symbol: Optional[str] = "MES"
@@ -290,6 +323,7 @@ class OrderSignal(BaseModel):
     order_type: str = "Market"
 
 
+# ================= 下单 =================
 @app.post("/api/place-order")
 async def api_place_order(signal: OrderSignal):
     action = signal.action.upper()
@@ -302,8 +336,6 @@ async def api_place_order(signal: OrderSignal):
         raise HTTPException(500, "账户未就绪")
 
     symbol = (signal.symbol or "MES").upper().strip()
-
-    # 解析合约
     contract = await resolve_contract(symbol)
     contract_name = contract.get("name", symbol)
 
@@ -335,14 +367,55 @@ async def api_place_order(signal: OrderSignal):
     }
 
 
+# ================= 查询 =================
 @app.get("/account-summary")
 async def get_account_summary():
-    return {
+    """账户 / 持仓 / 资金。带缓存和并发，防止压垮服务。"""
+    now = asyncio.get_running_loop().time()
+    if _acct_cache["data"] and now - _acct_cache["ts"] < _ACCT_TTL:
+        return _acct_cache["data"]
+
+    try:
+        accounts, positions, cash = await asyncio.gather(
+            _api_call("GET", "/account/list"),
+            _api_call("GET", "/position/list"),
+            _api_call("GET", "/cashBalance/list"),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"account-summary 异常: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"账户查询失败: {e}")
+
+    # 补合约名
+    enriched = []
+    for p in (positions or []):
+        cid = p.get("contractId")
+        symbol = p.get("symbol")
+        if not symbol and cid:
+            symbol = await _lookup_contract_name(cid)
+        enriched.append({**p, "symbol": symbol or str(cid)})
+
+    result = {
         "status": "success",
-        "accounts": await _api_call("GET", "/account/list"),
-        "positions": await _api_call("GET", "/position/list"),
-        "cash_balances": await _api_call("GET", "/cashBalance/list"),
+        "accounts": accounts or [],
+        "positions": enriched,
+        "cash_balances": cash or [],
     }
+    _acct_cache["data"] = result
+    _acct_cache["ts"] = now
+    return result
+
+
+async def _lookup_contract_name(contract_id: int) -> str:
+    """根据 contractId 查合约名，失败返回空字符串"""
+    try:
+        c = await _api_call("GET", f"/contract/item?id={contract_id}")
+        if c and c.get("name"):
+            return c["name"]
+    except Exception:
+        pass
+    return ""
 
 
 @app.get("/orders")
@@ -357,14 +430,13 @@ async def get_account_info():
 
 @app.get("/debug-contract")
 async def debug_contract(name: str = "MES"):
-    """诊断：查看品种解析结果"""
     try:
-        suggestions = await _api_call("GET", f"/contract/suggest?t={name}&l=10")
+        s = await _api_call("GET", f"/contract/suggest?t={name}&l=10")
         return {
             "status": "ok",
             "input": name,
-            "count": len(suggestions) if isinstance(suggestions, list) else 0,
-            "items": suggestions[:5] if isinstance(suggestions, list) else suggestions,
+            "count": len(s) if isinstance(s, list) else 0,
+            "items": s[:5] if isinstance(s, list) else s,
         }
     except HTTPException as e:
         return {"status": "error", "detail": e.detail}

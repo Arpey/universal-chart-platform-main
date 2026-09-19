@@ -10,6 +10,9 @@ import IndicatorsModal from './components/IndicatorsModal.vue'
 import DataSourceSwitcher from './components/DataSourceSwitcher.vue'
 import TradingPanel from './components/trading/TradingPanel.vue'
 import DirectOrderPanel from './components/trading/DirectOrderPanel.vue'
+import AccountPanel from './components/AccountPanel.vue'
+import PositionTable from './components/trading/PositionTable.vue'
+import OrderTable from './components/trading/OrderTable.vue'
 import { useMarketStore } from './stores/marketStore'
 import { useTradingStore } from './stores/tradingStore'
 import { connectMarket, connectIBKR, type WsDataType } from './services/wsService'
@@ -29,6 +32,16 @@ const indicatorModalOpen = ref(false)
 const activeTool = ref<DrawKind>('cursor')
 const clearSignal = ref(0)
 const toolActive = ref(false)
+
+/** 底部面板当前展开的标签（null = 全部收起，仅显示标签栏） */
+type BottomTab = 'account' | 'positions' | 'orders'
+const activeTab = ref<BottomTab | null>(null)
+
+/** 点击标签：同一标签再次点击收起，点击不同标签直接切换。 */
+function toggleTab(tab: BottomTab): void {
+  activeTab.value = activeTab.value === tab ? null : tab
+}
+
 let disconnect = () => {}
 
 /** 顶部/状态栏数据源标签：Tradovate / IBKR / Tradefi 分类 / Binance。 */
@@ -351,6 +364,18 @@ function openQuickOrder(preset: OrderPreset) {
             :symbol="market.symbol"
           />
         </div>
+
+        <!-- 底部面板（TradingView 风格）：标签栏常驻，内容区展开约 240px 可滚动 -->
+        <div class="bottom-tabs">
+          <button :class="{ active: activeTab === 'account' }" @click="toggleTab('account')">账户</button>
+          <button :class="{ active: activeTab === 'positions' }" @click="toggleTab('positions')">持仓</button>
+          <button :class="{ active: activeTab === 'orders' }" @click="toggleTab('orders')">订单</button>
+        </div>
+        <div v-if="activeTab" class="bottom-body">
+          <AccountPanel v-if="activeTab === 'account'" />
+          <PositionTable v-if="activeTab === 'positions'" />
+          <OrderTable v-if="activeTab === 'orders'" />
+        </div>
       </div>
       <Watchlist />
     </section>
@@ -559,6 +584,34 @@ function openQuickOrder(preset: OrderPreset) {
   min-width: 0;
   display: flex;
   flex-direction: column;
+}
+
+/* ---- 底部面板（TradingView 风格标签栏 + 可折叠内容区） ---- */
+.bottom-tabs {
+  display: flex;
+  border-top: 1px solid #2a2e39;
+  background: #131722;
+  height: 32px;
+  flex-shrink: 0;
+}
+.bottom-tabs button {
+  background: transparent;
+  border: none;
+  color: #787b86;
+  padding: 0 16px;
+  font-size: 12px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+}
+.bottom-tabs button.active { color: #d1d4dc; border-bottom-color: #2962ff; }
+.bottom-tabs button:hover { color: #d1d4dc; }
+
+/* 展开区：约 240px 高，内容超出滚动；收起时该容器不渲染（仅保留标签栏） */
+.bottom-body {
+  flex-shrink: 0;
+  height: 240px;
+  overflow-y: auto;
+  background: #131722;
 }
 
 /* 主图区 */
