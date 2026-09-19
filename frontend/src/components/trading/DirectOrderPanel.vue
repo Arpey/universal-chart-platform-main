@@ -1,47 +1,44 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useMarketStore } from '../../stores/marketStore'
+import { useTradingStore } from '../../stores/tradingStore'
+import type { BrokerType, OrderSide } from '../../types/trading'
 
 /**
- * 直连下单面板（Tradovate DOM 仿真下单入口）。
+ * 直连下单面板（统一交易入口）。
  *
- * 与 tradingStore 的 Mock / 网关链路（/api/trading）相互独立：
- * 这里直接 POST 本地 Playwright 下单微服务 pushOrder/app.py 的 /webhook，
- * 端口必须与该文件的 PORT 一致（默认 8000），可用 VITE_PUSH_ORDER_URL 覆盖。
+ * 下单链路统一走 tradingStore → IBrokerAdapter（Broker 由顶部下拉框切换）：
+ * - TRADOVATE_PLAYWRIGHT: 直连本地 Playwright 下单微服务（pushOrder/app.py，默认 http://localhost:8000）；
+ * - MOCK / TRADOVATE / IBKR: 其余适配器实现。
+ * 组件自身不再直连任何交易服务，只消费 store 的标准化状态与方法。
  */
-const PUSH_ORDER_BASE = (import.meta.env?.VITE_PUSH_ORDER_URL ?? 'http://localhost:8000').replace(/\/+$/, '')
-/** 单次下单请求超时（毫秒）：后端最多等待「按钮 10s + 成交确认 5s」，留足余量。 */
-const REQUEST_TIMEOUT_MS = 60000
+const BROKERS: { id: BrokerType; label: string }[] = [
+  { id: 'TRADOVATE_PLAYWRIGHT', label: 'Tradovate 直连' },
+  { id: 'MOCK', label: 'Mock 模拟盘' },
+  { id: 'TRADOVATE', label: 'Tradovate 网关' },
+  { id: 'IBKR', label: 'IBKR（占位）' },
+]
 
-type PushAction = 'BUY' | 'SELL'
 type StatusKind = 'idle' | 'pending' | 'success' | 'error'
 
-/** pushOrder/app.py `/webhook` 响应（失败时为 FastAPI 的 { detail }） */
-interface PushOrderResponse {
-  status?: string
-  action?: string
-  symbol?: string
-  qty?: number
-  message?: string
-  confirmed_by?: string
-  detail?: string
-}
-
 const market = useMarketStore()
+const trading = useTradingStore()
 
-/** 品种输入框：默认取当前图表品种，图表切换时自动跟随 */
+/** 品种输入框：默认取当前图表品种，图表切换时自动跟随（仍可手动改成 Root 合约，如 MES） */
 const symbolInput = ref<string>(market.symbol)
 const qtyInput = ref<number>(1)
 const statusKind = ref<StatusKind>('idle')
 const statusText = ref<string>('')
-const pendingAction = ref<PushAction | null>(null)
+const pendingAction = ref<OrderSide | null>(null)
+const switching = ref(false)
 
-const busy = computed(() => pendingAction.value !== null)
+const busy = computed(() => pendingAction.value !== null || switching.value)
 const canSend = computed(
-  () => !busy.value && symbolInput.value.trim().length > 0 && Number.isFinite(Number(qtyInput.value)) && Number(qtyInput.value) > 0,
+  () => !busy.value && trading.isConnected && symbolInput.value.trim().length > 0
+    && Number.isFinite(Number(qtyInput.value)) && Number(qtyInput.value) > 0,
 )
 
-// 图表品种变化 → 同步到输入框（仍可手动改成 Tradovate 中已打开的根合约，如 MES）
+// 图表品种变化 → 同步到输入框
 watch(
   () => market.symbol,
   (s) => {
@@ -49,23 +46,41 @@ watch(
   },
 )
 
-function parseResponse(text: string): PushOrderResponse {
-  if (!text) return {}
-  try {
-    const parsed: unknown = JSON.parse(text)
-    return parsed && typeof parsed === 'object' ? (parsed as PushOrderResponse) : {}
-  } catch {
-    return { message: text }
-  }
+// 挂载即连接当前 Broker（默认 MOCK 开箱即用），保证面板可直接下单
+onMounted(() => {
+  if (!trading.isConnected) void onBrokerChange(trading.currentBrokerType)
+})
+
+function brokerLabel(type: BrokerType): string {
+  return BROKERS.find((b) => b.id === type)?.label ?? type
 }
 
 function describeError(err: unknown): string {
-  if (err instanceof DOMException && err.name === 'AbortError') return `下单请求超时（${REQUEST_TIMEOUT_MS / 1000}s）`
-  if (err instanceof TypeError) return `网络错误：无法连接本地下单服务 ${PUSH_ORDER_BASE}，请确认 pushOrder/app.py 已启动`
+  if (err instanceof TypeError) return '网络错误：无法连接交易服务，请确认对应服务已启动'
   return err instanceof Error ? err.message : String(err)
 }
 
-async function send(action: PushAction) {
+/** 切换 Broker：销毁旧适配器 → 创建新适配器 → 立即连接并拉取初始数据。 */
+async function onBrokerChange(type: BrokerType) {
+  if (switching.value) return
+  switching.value = true
+  statusKind.value = 'pending'
+  statusText.value = `连接中…（${brokerLabel(type)}）`
+  try {
+    await trading.switchBroker(type)
+    await trading.connectBroker()
+    statusKind.value = 'success'
+    statusText.value = `已连接 ${brokerLabel(type)}`
+  } catch (err) {
+    statusKind.value = 'error'
+    statusText.value = `失败：${describeError(err)}`
+  } finally {
+    switching.value = false
+  }
+}
+
+/** 市价下单：统一经 tradingStore 派发到当前 Broker 适配器。 */
+async function send(action: OrderSide) {
   if (busy.value) return
 
   const symbol = symbolInput.value.trim().toUpperCase()
@@ -80,37 +95,44 @@ async function send(action: PushAction) {
     statusText.value = '失败：手数必须为正整数'
     return
   }
+  if (!trading.isConnected) {
+    statusKind.value = 'error'
+    statusText.value = '失败：Broker 未连接，请先在上方选择并连接 Broker'
+    return
+  }
 
   pendingAction.value = action
   statusKind.value = 'pending'
   statusText.value = `下单中…（${action} ${symbol} × ${qty}）`
 
-  const controller = new AbortController()
-  const timer = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
   try {
-    const response = await fetch(`${PUSH_ORDER_BASE}/webhook`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action, symbol, qty }),
-      signal: controller.signal,
-    })
-    const data = parseResponse(await response.text())
-    if (!response.ok) throw new Error(data.detail || data.message || `HTTP ${response.status}`)
+    const order = await trading.submitOrder({ symbol, side: action, type: 'MARKET', qty })
     statusKind.value = 'success'
-    statusText.value = `成功：${data.action ?? action} ${data.symbol ?? symbol} × ${data.qty ?? qty} 已提交${data.confirmed_by ? `（${data.confirmed_by}）` : ''}`
+    statusText.value = `成功：${order.side} ${order.symbol} × ${order.qty} 已提交（${order.orderId}）`
   } catch (err) {
     statusKind.value = 'error'
     statusText.value = `失败：${describeError(err)}`
   } finally {
-    window.clearTimeout(timer)
     pendingAction.value = null
   }
 }
 </script>
 
 <template>
-  <div class="push-order-bar" :title="'下单服务：' + PUSH_ORDER_BASE">
+  <div class="push-order-bar" :title="'当前 Broker：' + trading.currentBrokerType">
     <span class="po-title">⚡ 直连下单</span>
+
+    <label class="po-field">
+      <span class="po-label">Broker</span>
+      <select
+        class="po-input po-broker"
+        :value="trading.currentBrokerType"
+        :disabled="busy"
+        @change="onBrokerChange(($event.target as HTMLSelectElement).value as BrokerType)"
+      >
+        <option v-for="b in BROKERS" :key="b.id" :value="b.id">{{ b.label }}</option>
+      </select>
+    </label>
 
     <label class="po-field">
       <span class="po-label">品种</span>
@@ -184,6 +206,7 @@ async function send(action: PushAction) {
 .po-input:disabled { opacity: 0.5; cursor: not-allowed; }
 .po-symbol { width: 96px; text-transform: uppercase; }
 .po-qty { width: 62px; }
+.po-broker { width: 150px; }
 .po-btn {
   height: 26px;
   min-width: 62px;

@@ -4,7 +4,7 @@
  */
 
 /** 支持的经纪商类型 */
-export type BrokerType = 'TRADOVATE' | 'IBKR' | 'MOCK'
+export type BrokerType = 'TRADOVATE' | 'TRADOVATE_PLAYWRIGHT' | 'IBKR' | 'MOCK'
 
 /** 订单方向 */
 export type OrderSide = 'BUY' | 'SELL'

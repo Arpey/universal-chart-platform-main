@@ -1,8 +1,10 @@
 """
-app.py - 方案 B 修复版
-- 手动登录（推荐）或环境变量自动填表
-- 保存所有捕获到的 token，逐个尝试
-- 明确提示用户完成登录
+app.py
+Tradovate Executor - 方案 B 修复版
+- 手动登录 + Token 捕获
+- 修复 _api_call: 只有 401/403 才换 token
+- 合约查询改用 /contract/suggest
+- 新增 /debug-contract 诊断接口
 """
 
 import os
@@ -27,7 +29,7 @@ HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("tradovate")
 
-app = FastAPI(title="Tradovate Executor", version="2.1")
+app = FastAPI(title="Tradovate Executor", version="2.2")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 playwright_instance = None
@@ -36,7 +38,6 @@ context_instance: Optional[BrowserContext] = None
 page_instance: Optional[Page] = None
 lock = asyncio.Lock()
 
-# 所有捕获到的 token（去重，按捕获顺序）
 _token_candidates: List[str] = []
 _current_token: str = ""
 _account_info: Dict[str, Any] = {}
@@ -45,7 +46,8 @@ TRADE_API_HINTS = ["/account/", "/order/", "/position/", "/cashBalance/", "/cont
 
 
 async def _capture_auth(request):
-    """捕获所有带 Bearer 的请求，记录 token 和来源 URL"""
+    """捕获所有带 Bearer 的请求"""
+    global _current_token
     try:
         if "tradovateapi.com" not in request.url:
             return
@@ -59,10 +61,7 @@ async def _capture_auth(request):
             is_trade = any(h in request.url for h in TRADE_API_HINTS)
             tag = "交易API" if is_trade else "其他"
             logger.info(f"🔑 捕获 Token [{tag}] 长度={len(token)} 来源={request.url}")
-
-            # 交易 API 的 token 优先
             if is_trade:
-                global _current_token
                 _current_token = token
     except Exception:
         pass
@@ -92,7 +91,10 @@ async def _try_token(method: str, url: str, token: str, payload: dict = None):
 
 
 async def _api_call(method: str, path: str, payload: dict = None) -> Any:
-    """遍历所有候选 token，找到能用的那个"""
+    """
+    遍历所有候选 token，找到能用的那个。
+    关键修复：只有 401/403 才换 token 重试；其他 4xx 直接抛错。
+    """
     global _current_token
 
     if not _token_candidates and not _current_token:
@@ -100,7 +102,6 @@ async def _api_call(method: str, path: str, payload: dict = None) -> Any:
 
     url = f"{TRADOVATE_API_BASE}{path}"
 
-    # 构造尝试顺序：当前 token 优先，然后其他倒序
     candidates = []
     if _current_token:
         candidates.append(_current_token)
@@ -112,23 +113,24 @@ async def _api_call(method: str, path: str, payload: dict = None) -> Any:
     for token in candidates:
         ok, status, data = await _try_token(method, url, token, payload)
         if ok:
-            # 成功，把这个 token 标记为当前
             if token != _current_token:
                 _current_token = token
                 logger.info(f"✅ Token 切换为 (长度={len(token)})")
             return data
 
-        last_status = status
-        logger.debug(f"Token (len={len(token)}) 失败: {status}")
+        # 只有认证失败才换 token
+        if status in (401, 403):
+            last_status = status
+            continue
+
+        # 其他错误（404、400、500 等）直接抛出
+        raise HTTPException(status, f"API 错误 [{status}]: {data}")
 
     raise HTTPException(401, f"所有 Token 均失效 (最后状态码: {last_status})")
 
 
 async def wait_for_login_and_token(timeout_sec: int = 300) -> bool:
-    """
-    等待用户完成登录 + 捕获有效 token。
-    策略：每 5 秒检查一次交易界面元素，同时监控 token 抓取情况。
-    """
+    """等待用户完成登录 + 捕获有效 token"""
     logger.info("=" * 60)
     logger.info("📌 请在弹出的浏览器中手动登录 Tradovate")
     logger.info("   1. 输入用户名密码（含 2FA）")
@@ -140,7 +142,6 @@ async def wait_for_login_and_token(timeout_sec: int = 300) -> bool:
     while asyncio.get_running_loop().time() - start < timeout_sec:
         await page_instance.wait_for_timeout(5000)
 
-        # 检查交易界面
         try:
             btns = await page_instance.locator(
                 'button:has-text("市价买入"), button:has-text("市价卖出"), '
@@ -149,7 +150,7 @@ async def wait_for_login_and_token(timeout_sec: int = 300) -> bool:
             ).count()
             if btns > 0:
                 logger.info("✅ 已检测到交易界面按钮")
-                await page_instance.wait_for_timeout(5000)  # 等 API 请求发出
+                await page_instance.wait_for_timeout(5000)
                 return True
         except Exception:
             pass
@@ -207,6 +208,42 @@ async def refresh_account_info():
         logger.error(f"❌ 获取账户失败: {e}")
 
 
+async def resolve_contract(symbol: str) -> Dict[str, Any]:
+    """
+    把用户输入的品种（如 MES）解析为具体合约（如 MESZ5）。
+    优先用 /contract/suggest 模糊搜索，失败则用 /contract/find 精确查找。
+    """
+    symbol = symbol.upper().strip()
+
+    # 方式 1: suggest 模糊搜索
+    try:
+        suggestions = await _api_call("GET", f"/contract/suggest?t={symbol}&l=10")
+        if suggestions and isinstance(suggestions, list):
+            # 优先取名字以 symbol 开头的
+            for c in suggestions:
+                name = (c.get("name") or "").upper()
+                if name.startswith(symbol):
+                    logger.info(f"🔍 suggest: {symbol} → {c.get('name')} (id={c.get('id')})")
+                    return c
+            # 没匹配前缀就用第一个
+            first = suggestions[0]
+            logger.info(f"🔍 suggest 兜底: {symbol} → {first.get('name')} (id={first.get('id')})")
+            return first
+    except HTTPException as e:
+        logger.warning(f"⚠️ suggest 失败: {e.detail}，尝试 find")
+
+    # 方式 2: find 精确查找
+    try:
+        contract = await _api_call("GET", f"/contract/find?name={symbol}")
+        if contract and contract.get("id"):
+            logger.info(f"🔍 find: {symbol} → {contract.get('name')} (id={contract.get('id')})")
+            return contract
+    except HTTPException as e:
+        logger.warning(f"⚠️ find 失败: {e.detail}")
+
+    raise HTTPException(404, f"找不到合约 {symbol}")
+
+
 @app.on_event("startup")
 async def startup_event():
     global playwright_instance, browser_instance, context_instance, page_instance
@@ -227,8 +264,6 @@ async def startup_event():
 
     await page_instance.wait_for_timeout(3000)
     await auto_fill_form()
-
-    # 等待用户完成登录
     await wait_for_login_and_token(timeout_sec=300)
 
     if _token_candidates:
@@ -264,20 +299,17 @@ async def api_place_order(signal: OrderSignal):
     if not _account_info.get("accountId"):
         await refresh_account_info()
     if not _account_info.get("accountId"):
-        raise HTTPException(500, "账户未就绪，请检查 Token 是否有效")
+        raise HTTPException(500, "账户未就绪")
 
     symbol = (signal.symbol or "MES").upper().strip()
-    try:
-        contract = await _api_call("GET", f"/contract/find?name={symbol}")
-    except HTTPException as e:
-        raise HTTPException(404, f"找不到合约 {symbol}: {e.detail}")
 
-    if not contract or not contract.get("id"):
-        raise HTTPException(404, f"合约 {symbol} 查询无结果")
+    # 解析合约
+    contract = await resolve_contract(symbol)
+    contract_name = contract.get("name", symbol)
 
     payload = {
         "action": "Buy" if action == "BUY" else "Sell",
-        "symbol": contract.get("name", symbol),
+        "symbol": contract_name,
         "orderQty": signal.qty,
         "orderType": signal.order_type or "Market",
         "accountSpec": _account_info["accountSpec"],
@@ -294,7 +326,13 @@ async def api_place_order(signal: OrderSignal):
 
     order_id = result.get("orderId")
     logger.info(f"✅ [下单成功] orderId={order_id}")
-    return {"status": "success", "orderId": order_id, "symbol": symbol, "action": action, "qty": signal.qty}
+    return {
+        "status": "success",
+        "orderId": order_id,
+        "symbol": contract_name,
+        "action": action,
+        "qty": signal.qty,
+    }
 
 
 @app.get("/account-summary")
@@ -315,6 +353,23 @@ async def get_orders():
 @app.get("/account-info")
 async def get_account_info():
     return {"status": "success", "account": _account_info}
+
+
+@app.get("/debug-contract")
+async def debug_contract(name: str = "MES"):
+    """诊断：查看品种解析结果"""
+    try:
+        suggestions = await _api_call("GET", f"/contract/suggest?t={name}&l=10")
+        return {
+            "status": "ok",
+            "input": name,
+            "count": len(suggestions) if isinstance(suggestions, list) else 0,
+            "items": suggestions[:5] if isinstance(suggestions, list) else suggestions,
+        }
+    except HTTPException as e:
+        return {"status": "error", "detail": e.detail}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
 
 
 @app.get("/health")
