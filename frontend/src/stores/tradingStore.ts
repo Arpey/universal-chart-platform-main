@@ -41,7 +41,7 @@ export const useTradingStore = defineStore('trading', () => {
   const isConnected = ref(false)
   const positions = ref<Position[]>([])
   const orders = ref<Order[]>([])
-  const accountSummary = ref<AccountSummary>()
+  const accountSummary = ref<AccountSummary | null>(null)
   /** 当前交易品种（由外部行情侧调用 setActiveSymbol 同步） */
   const activeSymbol = ref('')
   /** 最近一次操作错误信息（供 UI 提示） */
@@ -77,7 +77,7 @@ export const useTradingStore = defineStore('trading', () => {
     isConnected.value = false
     positions.value = []
     orders.value = []
-    accountSummary.value = undefined
+    accountSummary.value = null
     positionBrackets.value = {}
     orderPreset.value = null
     error.value = ''
@@ -129,15 +129,25 @@ export const useTradingStore = defineStore('trading', () => {
   // ---------- actions ----------
 
   /**
-   * 切换 Broker：销毁旧 Adapter（退订 + 断开）、创建新 Adapter 并绑定更新回调。
-   * 切换后交易状态清空，需重新 connectBroker()。
+   * 切换 Broker：断开并销毁旧 Adapter（退订 + 断开）、创建新 Adapter 并绑定更新回调、
+   * 立即建立连接并拉取账户资金 / 持仓（账户面板等 UI 可直接消费）。
    */
   async function switchBroker(type: BrokerType): Promise<void> {
-    if (type === currentBrokerType.value && adapter) return // 同类型切换幂等
+    if (type === currentBrokerType.value && adapter && isConnected.value) return // 同类型且已连接：幂等
     disposeAdapter()
     currentBrokerType.value = type
     adapter = BrokerFactory.createAdapter(type)
     bindAdapter(adapter)
+    error.value = ''
+    try {
+      await adapter.connect()
+      isConnected.value = true
+      await refreshAccount()
+    } catch (e) {
+      isConnected.value = false
+      error.value = e instanceof Error ? e.message : String(e)
+      throw e
+    }
   }
 
   /** 连接当前 Broker 并拉取初始持仓 / 订单 / 账户。 */
@@ -197,6 +207,17 @@ export const useTradingStore = defineStore('trading', () => {
       error.value = e instanceof Error ? e.message : String(e)
       throw e
     }
+  }
+
+  /** 仅拉取账户资金与持仓（账户面板轮询入口；订单列表仍由 refreshData 维护）。 */
+  async function refreshAccount(): Promise<void> {
+    if (!adapter || !isConnected.value) return
+    const [acc, pos] = await Promise.allSettled([
+      adapter.getAccountSummary(),
+      adapter.getPositions(),
+    ])
+    if (acc.status === 'fulfilled') accountSummary.value = acc.value
+    if (pos.status === 'fulfilled') positions.value = pos.value
   }
 
   /** 主动拉取持仓 / 订单 / 账户（任一失败不影响其余两项，store 状态保持各自最新）。 */
@@ -406,6 +427,7 @@ export const useTradingStore = defineStore('trading', () => {
     closePosition,
     cancelOrder,
     refreshData,
+    refreshAccount,
     setActiveSymbol,
     feedMarkPrice,
     getPositionBracket,

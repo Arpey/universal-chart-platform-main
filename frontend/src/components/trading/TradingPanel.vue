@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, watch } from 'vue'
+import AccountPanel from '../AccountPanel.vue'
 import OrderForm from './OrderForm.vue'
 import PositionTable from './PositionTable.vue'
 import OrderTable from './OrderTable.vue'
@@ -73,6 +74,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 
         <div class="tp-body">
           <OrderForm />
+          <!-- 账户面板：余额 / 权益 / 可用保证金 / 浮动盈亏 + 持仓表（图表下方独立区块） -->
+          <AccountPanel />
           <PositionTable />
           <OrderTable />
         </div>

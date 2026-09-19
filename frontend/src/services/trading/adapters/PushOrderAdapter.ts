@@ -343,40 +343,39 @@ function toOrder(value: unknown): Order | null {
   return order
 }
 
-/** 持仓转换：兼容统一结构（symbol / side / qty / markPrice ...）与 Tradovate 原始结构（contractId / netPos / netPrice ...）。 */
+/** 持仓转换：把 pushOrder /account-summary 的原始持仓数组元素映射为统一 Position。
+ *  原始字段：symbol / netPos（净持仓，正=多、负=空）/ netPrice（持仓均价）/ currentPrice（现价）/ unrealizedPnl（浮动盈亏）。 */
 function toPosition(value: unknown): Position | null {
   const raw = asRecord(value)
   if (!raw) return null
 
-  const netPos = asNumber(raw.netPos)
-  const entryPrice = asNumber(raw.entryPrice ?? raw.netPrice) ?? 0
+  const netPos = asNumber(raw.netPos) ?? 0
+  const entryPrice = asNumber(raw.netPrice) ?? 0
 
   return {
     symbol: asText(raw.symbol) ?? asText(raw.contractId) ?? '',
-    side: normalizeSide(raw.side) ?? (netPos !== null && netPos < 0 ? 'SELL' : 'BUY'),
-    qty: asNumber(raw.qty) ?? (netPos === null ? 0 : Math.abs(netPos)),
+    side: netPos >= 0 ? 'BUY' : 'SELL',
+    qty: Math.abs(netPos),
     entryPrice,
-    // 服务未提供标记价时退化为开仓价（pnl 暂以 0 兜底）
-    markPrice: asNumber(raw.markPrice ?? raw.netPrice) ?? entryPrice,
-    pnl: asNumber(raw.pnl) ?? 0,
+    // 服务未提供现价时退化为持仓均价（pnl 由 0 兜底）
+    markPrice: asNumber(raw.currentPrice) ?? entryPrice,
+    pnl: asNumber(raw.unrealizedPnl) ?? 0,
     brokerId: asText(raw.brokerId) ?? 'TRADOVATE',
     updatedAt: asTimestamp(raw.updatedAt ?? raw.timestamp, Date.now()),
   }
 }
 
 /**
- * 账户汇总转换：取 accounts[0]（Tradovate 账户对象不含资金字段时，用 cash_balances[0].amount 兜底）。
+ * 账户汇总转换：取 accounts[0]（账户主体）与 cash_balances[0]（资金余额）。
  * 字段缺失时按 AccountSummary 契约回退：balance 0、equity = balance、marginUsed 0、freeMargin = equity - marginUsed。
  */
 function toAccountSummary(value: unknown): AccountSummary {
   const data = asRecord(value) ?? {}
-  const account = unwrapArray(data, 'accounts')
-    .map(asRecord)
-    .find((item): item is Record<string, unknown> => item !== null) ?? data
-  const cash = unwrapArray(data, 'cash_balances').map(asRecord)[0] ?? null
+  const account = asRecord(unwrapArray(data, 'accounts')[0]) ?? data
+  const cash = asRecord(unwrapArray(data, 'cash_balances')[0])
 
   const balance = asNumber(account.balance ?? cash?.amount) ?? 0
-  const marginUsed = asNumber(account.marginUsed) ?? 0
+  const marginUsed = asNumber(account.marginUsed ?? cash?.marginUsed) ?? 0
   const equity = asNumber(account.equity) ?? balance
 
   return {
@@ -384,7 +383,7 @@ function toAccountSummary(value: unknown): AccountSummary {
     equity,
     marginUsed,
     freeMargin: asNumber(account.freeMargin) ?? equity - marginUsed,
-    currency: asText(account.currency) ?? 'USD',
+    currency: asText(account.currency ?? cash?.currency) ?? 'USD',
     brokerId: asText(account.brokerId) ?? 'TRADOVATE',
     updatedAt: asTimestamp(account.updatedAt ?? account.timestamp, Date.now()),
   }
