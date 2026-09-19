@@ -80,34 +80,34 @@ function pickView(v: MarketView) {
 }
 
 const DRAW_GROUPS: { title: string; items: { key: DrawKind; icon: string; title: string }[] }[] = [
-  { title: '选择', items: [{ key: 'cursor', icon: '🖱', title: '光标/选择' }] },
+  { title: '选择', items: [{ key: 'cursor', icon: 'M5 3l14 8-6 1-1 6z', title: '光标/选择' }] },
   {
     title: '趋势线',
     items: [
-      { key: 'trend', icon: '╱', title: '趋势线（线段，两点）' },
-      { key: 'ray', icon: '➤', title: '射线（两点，向右延伸）' },
-      { key: 'hray', icon: '─', title: '水平射线（单点，向右延伸）' },
+      { key: 'trend', icon: 'M4 20L20 4', title: '趋势线（线段，两点）' },
+      { key: 'ray', icon: 'M4 20L20 4M14 4h6v6', title: '射线（两点，向右延伸）' },
+      { key: 'hray', icon: 'M3 12h15M15 9l3 3-3 3', title: '水平射线（单点，向右延伸）' },
     ],
   },
   {
     title: '测量',
     items: [
-      { key: 'vline', icon: '│', title: '垂直线（单点）' },
-      { key: 'ruler', icon: '▭', title: '测量工具（两点）' },
+      { key: 'vline', icon: 'M12 3v18', title: '垂直线（单点）' },
+      { key: 'ruler', icon: 'M3 9h18v6H3zM7 9v3M11 9v3M15 9v3M19 9v3', title: '测量工具（两点）' },
     ],
   },
   {
     title: '持仓',
     items: [
-      { key: 'long', icon: '▲', title: '多头持仓（两点：入场 → 止盈，止损自动镜像，三锚点可拖）' },
-      { key: 'short', icon: '▼', title: '空头持仓（两点：入场 → 止损，止盈自动镜像，三锚点可拖）' },
+      { key: 'long', icon: 'M4 20l6-8 3 3 7-11M14 4h6v6', title: '多头持仓（两点：入场 → 止盈）' },
+      { key: 'short', icon: 'M4 4l6 8 3-3 7 11M14 20h6v-6', title: '空头持仓（两点：入场 → 止损）' },
     ],
   },
   {
     title: '斐波那契',
     items: [
-      { key: 'fib', icon: 'ƒ', title: '斐波那契回调（两点：趋势起点 A → 终点 B）' },
-      { key: 'fibext', icon: '⇗', title: '趋势型斐波那契扩展（三点：A → B → C 回调点）' },
+      { key: 'fib', icon: 'M3 21L21 3M3 7h18M3 12h18M3 17h18', title: '斐波那契回调' },
+      { key: 'fibext', icon: 'M3 3L21 21M3 7h18M3 12h18M3 17h18', title: '趋势型斐波那契扩展' },
     ],
   },
 ]
@@ -301,21 +301,37 @@ function openQuickOrder(preset: OrderPreset) {
       <aside class="toolbar">
         <template v-for="(group, gi) in DRAW_GROUPS" :key="group.title">
           <span class="tool-group-title">{{ group.title }}</span>
-          <button
+                    <button
             v-for="t in group.items"
             :key="t.key"
             class="tool"
             :class="{ active: activeTool === t.key }"
             :title="t.title"
             @click="pickTool(t.key)"
-          ><span class="tool-icon">{{ t.icon }}</span></button>
+          >
+            <svg class="tool-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path :d="t.icon" />
+            </svg>
+          </button>
           <span v-if="gi < DRAW_GROUPS.length - 1" class="tool-sep"></span>
         </template>
 
-        <span class="tool-sep"></span>
-        <button class="tool" :class="{ active: magnet }" title="磁吸模式（Ctrl/Cmd 可临时启用）" @click="magnet = !magnet">🧲</button>
-        <button class="tool" :class="{ active: stayInMode }" title="连续绘制模式（画完保持当前工具）" @click="stayInMode = !stayInMode">🔁</button>
-        <button class="tool danger" title="清除全部画线" @click="clearDrawings">✕</button>
+                <span class="tool-sep"></span>
+        <button class="tool" :class="{ active: magnet }" title="磁吸模式（Ctrl/Cmd 可临时启用）" @click="magnet = !magnet">
+          <svg class="tool-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M7 4v9a5 5 0 0 0 10 0V4h-3v9a2 2 0 0 1-4 0V4z" />
+          </svg>
+        </button>
+        <button class="tool" :class="{ active: stayInMode }" title="连续绘制模式（画完保持当前工具）" @click="stayInMode = !stayInMode">
+          <svg class="tool-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 11a8 8 0 0 1 13-6l3 3M20 13a8 8 0 0 1-13 6l-3-3M20 5v6h-6M4 19v-6h6" />
+          </svg>
+        </button>
+        <button class="tool danger" title="清除全部画线" @click="clearDrawings">
+          <svg class="tool-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M6 6l12 12M18 6L6 18" />
+          </svg>
+        </button>
       </aside>
 
       <!-- 主图区（上方为 Tradovate 直连下单条，下方为 K线/盘口/Tick 视图） -->
@@ -572,7 +588,11 @@ function openQuickOrder(preset: OrderPreset) {
   background: transparent; color: var(--color-text-muted);
   border: none; border-radius: 6px; cursor: pointer;
 }
-.tool .tool-icon { font-size: 15px; line-height: 1; }
+.tool-svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
 .tool:hover { background: var(--color-bg-tertiary); color: var(--color-text); }
 .tool.active { background: #3b82f6; color: #fff; }
 .tool.danger { margin-top: 6px; color: #ef534f; font-size: 13px; }
