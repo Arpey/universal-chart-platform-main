@@ -1,112 +1,34 @@
 """
-Tradovate 发单微服务（FastAPI + Playwright DOM 仿真 + REST 结果校验）。
-
-模块划分：
-1. 全局配置与状态（环境变量化，默认 demo 环境）
-2. 请求 Payload 结构定义
-3. 网络拦截与生命周期
-4. 辅助函数：DOM 定位 / Token 提取 / 手数填写 / 下单点击与成交确认
-5. API 路由：/webhook、/cancel-all、/flatten、/account-summary、/positions、/health、/diagnose
+app.py - 方案 B 修复版
+- 手动登录（推荐）或环境变量自动填表
+- 保存所有捕获到的 token，逐个尝试
+- 明确提示用户完成登录
 """
 
-import asyncio
-import json
-import logging
 import os
-import sys
-import time
-from typing import Any, Dict, List, Optional, Tuple, Union
-
+import asyncio
 import httpx
+import logging
+from typing import Optional, Dict, Any, List
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from playwright.async_api import (
-    Browser,
-    BrowserContext,
-    Locator,
-    Page,
-    async_playwright,
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+
+TRADOVATE_USER = os.environ.get("TRADOVATE_USER", "")
+TRADOVATE_PASS = os.environ.get("TRADOVATE_PASS", "")
+TRADOVATE_URL = "https://trader.tradovate.com/"
+TRADOVATE_API_BASE = os.environ.get(
+    "TRADOVATE_API_BASE", "https://demo.tradovateapi.com/v1"
 )
+PORT = int(os.environ.get("PORT", "8000"))
+HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true"
 
-# ================= 1. 全局配置与状态 =================
-# 凭证 / 日志固定落在脚本所在目录，不受启动时的工作目录影响
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATE_FILE = os.path.join(BASE_DIR, "state.json")     # 登录凭证持久化文件
-LOG_FILE = os.path.join(BASE_DIR, "app.log")          # 运行日志文件
-TRADOVATE_URL = os.environ.get("TRADOVATE_URL", "https://trader.tradovate.com/")
-# 模拟盘: https://demo.tradovateapi.com/v1 ；实盘: https://live.tradovateapi.com/v1
-TRADOVATE_API_BASE = os.environ.get("TRADOVATE_API_BASE", "https://demo.tradovateapi.com/v1")
-PORT = int(os.environ.get("PORT", "8000"))            # 服务端口（前端调用端口需与此一致）
-BUTTON_WAIT_TIMEOUT_MS = 10000                        # 按钮可见等待上限（毫秒）
-ORDER_CONFIRM_TIMEOUT = float(os.environ.get("ORDER_CONFIRM_TIMEOUT", "5"))  # 下单确认轮询上限（秒）
-ORDER_CONFIRM_INTERVAL = 0.5                          # 下单确认轮询间隔（秒）
-CORS_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("tradovate")
 
-# 手数输入框：找不到时必须报错，绝不静默沿用 Tradovate 默认手数
-QTY_INPUT_SELECTOR = 'input[data-qa*="qty"], input[name*="qty"], input[type="number"]'
-SYMBOL_CONTAINER_SELECTOR = (
-    '.module-container:has-text("{s}"), '
-    '.chart-module:has-text("{s}"), '
-    'div[data-symbol*="{s}"]'
-)
-# 按钮文案兼容列表：依次尝试，取第一个可见按钮
-BUY_BUTTON_TEXTS = ("Buy Market", "Buy", "Bid")
-SELL_BUTTON_TEXTS = ("Sell Market", "Sell", "Ask")
-CANCEL_BUTTON_TEXTS = ("Cancel All", "Cancel Orders")
-FLATTEN_BUTTON_TEXTS = ("Flatten", "Exit & Cancel")
-
-
-def _setup_logging() -> logging.Logger:
-    """日志同时输出到 stdout 与 app.log（替代原 print）。"""
-    # Windows 控制台默认 GBK：尽量切到 UTF-8，避免日志里的 emoji 触发编码异常
-    if hasattr(sys.stdout, "reconfigure"):
-        try:
-            sys.stdout.reconfigure(encoding="utf-8")
-        except Exception:
-            pass
-
-    logger = logging.getLogger("push_order")
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    if logger.handlers:
-        return logger
-
-    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setFormatter(formatter)
-    logger.addHandler(stream_handler)
-
-    try:
-        file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-    except Exception as exc:  # 日志文件不可写时不影响服务启动
-        logger.warning("日志文件 %s 初始化失败，仅输出到 stdout: %s", LOG_FILE, exc)
-    return logger
-
-
-logger = _setup_logging()
-
-
-def describe_environment() -> str:
-    """当前 Tradovate 环境描述（demo / live）。"""
-    return "LIVE（实盘）" if "demo" not in TRADOVATE_API_BASE.lower() else "DEMO（模拟盘）"
-
-
-app = FastAPI(
-    title="Tradovate Light Executor & Monitor",
-    description="基于 Playwright 的 Tradovate 零延迟发单、持仓监控与指定品种撤单微服务"
-)
-
-# 前端（Vite dev server: 5173）跨域调用必需
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="Tradovate Executor", version="2.1")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 playwright_instance = None
 browser_instance: Optional[Browser] = None
@@ -114,519 +36,285 @@ context_instance: Optional[BrowserContext] = None
 page_instance: Optional[Page] = None
 lock = asyncio.Lock()
 
-latest_positions_cache: Dict[str, Any] = {}
-latest_orders_cache: Dict[str, Any] = {}
+# 所有捕获到的 token（去重，按捕获顺序）
+_token_candidates: List[str] = []
+_current_token: str = ""
+_account_info: Dict[str, Any] = {}
+
+TRADE_API_HINTS = ["/account/", "/order/", "/position/", "/cashBalance/", "/contract/", "/user/"]
 
 
-# ================= 2. 请求 Payload 结构定义 =================
-class OrderSignal(BaseModel):
-    action: str                        # BUY, SELL, CANCEL_ALL, FLATTEN
-    symbol: Optional[str] = "MES"      # 合约代码/品种 (例如 MES, MNQ, MCL)
-    qty: int = 1                       # 数量
-    order_type: str = "MARKET"
-
-
-# ================= 3. 拦截与生命周期 =================
-async def handle_response(response):
-    """被动缓存 Tradovate 页面自身请求到的持仓 / 订单数据（REST 失败时兜底）。"""
-    global latest_positions_cache, latest_orders_cache
+async def _capture_auth(request):
+    """捕获所有带 Bearer 的请求，记录 token 和来源 URL"""
     try:
-        url = response.url
-        if response.status != 200:
+        if "tradovateapi.com" not in request.url:
             return
-        if "position/list" in url or "position/deps" in url:
-            latest_positions_cache["data"] = await response.json()
-            latest_positions_cache["updated_at"] = asyncio.get_event_loop().time()
-        elif "order/list" in url or "order/deps" in url:
-            latest_orders_cache["data"] = await response.json()
-            latest_orders_cache["updated_at"] = asyncio.get_event_loop().time()
+        auth = request.headers.get("authorization", "")
+        if not auth.startswith("Bearer ") or len(auth) < 30:
+            return
+        token = auth[7:]
+
+        if token not in _token_candidates:
+            _token_candidates.append(token)
+            is_trade = any(h in request.url for h in TRADE_API_HINTS)
+            tag = "交易API" if is_trade else "其他"
+            logger.info(f"🔑 捕获 Token [{tag}] 长度={len(token)} 来源={request.url}")
+
+            # 交易 API 的 token 优先
+            if is_trade:
+                global _current_token
+                _current_token = token
     except Exception:
         pass
 
 
-async def block_unnecessary_resources(route):
-    if route.request.resource_type in ["image", "media", "font"]:
-        await route.abort()
-    else:
-        await route.continue_()
+async def _try_token(method: str, url: str, token: str, payload: dict = None):
+    """用指定 token 调一次 API，返回 (ok, status, data)"""
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            if method == "GET":
+                resp = await client.get(url, headers=headers)
+            else:
+                resp = await client.post(url, headers=headers, json=payload)
+        except httpx.RequestError as e:
+            return False, 0, str(e)
+
+    try:
+        data = resp.json()
+    except Exception:
+        data = {"raw": resp.text[:200]}
+
+    return resp.status_code in (200, 201), resp.status_code, data
+
+
+async def _api_call(method: str, path: str, payload: dict = None) -> Any:
+    """遍历所有候选 token，找到能用的那个"""
+    global _current_token
+
+    if not _token_candidates and not _current_token:
+        raise HTTPException(401, "尚未捕获到任何 Token")
+
+    url = f"{TRADOVATE_API_BASE}{path}"
+
+    # 构造尝试顺序：当前 token 优先，然后其他倒序
+    candidates = []
+    if _current_token:
+        candidates.append(_current_token)
+    for t in reversed(_token_candidates):
+        if t != _current_token:
+            candidates.append(t)
+
+    last_status = 0
+    for token in candidates:
+        ok, status, data = await _try_token(method, url, token, payload)
+        if ok:
+            # 成功，把这个 token 标记为当前
+            if token != _current_token:
+                _current_token = token
+                logger.info(f"✅ Token 切换为 (长度={len(token)})")
+            return data
+
+        last_status = status
+        logger.debug(f"Token (len={len(token)}) 失败: {status}")
+
+    raise HTTPException(401, f"所有 Token 均失效 (最后状态码: {last_status})")
+
+
+async def wait_for_login_and_token(timeout_sec: int = 300) -> bool:
+    """
+    等待用户完成登录 + 捕获有效 token。
+    策略：每 5 秒检查一次交易界面元素，同时监控 token 抓取情况。
+    """
+    logger.info("=" * 60)
+    logger.info("📌 请在弹出的浏览器中手动登录 Tradovate")
+    logger.info("   1. 输入用户名密码（含 2FA）")
+    logger.info("   2. 如果出现交易模式选择页，点击进入")
+    logger.info("   3. 直到看到【市价买入 / 市价卖出】按钮")
+    logger.info("=" * 60)
+
+    start = asyncio.get_running_loop().time()
+    while asyncio.get_running_loop().time() - start < timeout_sec:
+        await page_instance.wait_for_timeout(5000)
+
+        # 检查交易界面
+        try:
+            btns = await page_instance.locator(
+                'button:has-text("市价买入"), button:has-text("市价卖出"), '
+                'button:has-text("Buy Market"), button:has-text("Sell Market"), '
+                'button:has-text("在竞买价买入"), button:has-text("卖出出价")'
+            ).count()
+            if btns > 0:
+                logger.info("✅ 已检测到交易界面按钮")
+                await page_instance.wait_for_timeout(5000)  # 等 API 请求发出
+                return True
+        except Exception:
+            pass
+
+        elapsed = int(asyncio.get_running_loop().time() - start)
+        if elapsed % 30 < 5:
+            logger.info(f"   ... 等待登录 ({elapsed}s) | 已捕获 {len(_token_candidates)} 个 token")
+
+    logger.warning("⚠️ 等待超时")
+    return False
+
+
+async def auto_fill_form():
+    """如果设置了用户名密码，自动填写表单"""
+    if not (TRADOVATE_USER and TRADOVATE_PASS):
+        return
+    try:
+        for sel in ['input[name="username"]', 'input[name="name"]', 'input[type="text"]', 'input[type="email"]']:
+            loc = page_instance.locator(sel).first
+            if await loc.count() > 0:
+                await loc.fill(TRADOVATE_USER)
+                logger.info("📝 已填用户名")
+                break
+
+        pwd = page_instance.locator('input[type="password"]').first
+        if await pwd.count() > 0:
+            await pwd.fill(TRADOVATE_PASS)
+            logger.info("📝 已填密码")
+
+        submit = page_instance.locator('button[type="submit"]').first
+        if await submit.count() > 0:
+            await submit.click()
+        else:
+            await pwd.press("Enter")
+        logger.info("🔑 已提交登录表单")
+    except Exception as e:
+        logger.warning(f"⚠️ 自动填写失败: {e}")
+
+
+async def refresh_account_info():
+    global _account_info
+    try:
+        accounts = await _api_call("GET", "/account/list")
+        if not accounts:
+            logger.warning("⚠️ 账户列表为空")
+            return
+        acc = accounts[0]
+        _account_info = {
+            "accountId": acc.get("id"),
+            "accountSpec": acc.get("name"),
+            "accountName": acc.get("nickname") or acc.get("name"),
+        }
+        logger.info(f"✅ 账户已缓存: {_account_info}")
+    except Exception as e:
+        logger.error(f"❌ 获取账户失败: {e}")
 
 
 @app.on_event("startup")
 async def startup_event():
     global playwright_instance, browser_instance, context_instance, page_instance
 
-    logger.info("🚀 [系统启动] 当前 Tradovate 环境: %s（API: %s）", describe_environment(), TRADOVATE_API_BASE)
-    logger.info("🚀 [系统启动] 正在初始化 Playwright 常驻 Firefox 无头浏览器...")
+    mode = "LIVE 🔴" if "live" in TRADOVATE_API_BASE else "DEMO 🟢"
+    logger.info(f"🚀 启动 | 环境: {mode} | API: {TRADOVATE_API_BASE} | Headless: {HEADLESS}")
+
     playwright_instance = await async_playwright().start()
-
-    # 采用 Firefox 内核避开 Windows Server 下 chromium 的 chrome.dll 0x7F 错误
-    browser_instance = await playwright_instance.firefox.launch(headless=True)
-
-    if os.path.exists(STATE_FILE):
-        logger.info("🔑 正在读取凭证文件 %s ...", STATE_FILE)
-        context_instance = await browser_instance.new_context(storage_state=STATE_FILE)
-    else:
-        logger.warning("⚠️ 未找到 state.json 凭证文件（%s）！请先运行 save_session.py 生成。", STATE_FILE)
-        context_instance = await browser_instance.new_context()
-
+    browser_instance = await playwright_instance.firefox.launch(headless=HEADLESS)
+    context_instance = await browser_instance.new_context(viewport={"width": 1920, "height": 1080})
     page_instance = await context_instance.new_page()
+    page_instance.on("request", _capture_auth)
 
-    page_instance.on("response", handle_response)
-    await page_instance.route("**/*", block_unnecessary_resources)
-
-    logger.info("🌐 正在预热载入 Tradovate 页面: %s", TRADOVATE_URL)
     try:
-        await page_instance.goto(TRADOVATE_URL, wait_until="networkidle", timeout=60000)
-        logger.info("✅ [系统就绪] Tradovate DOM 结构与 Session 会话加载完成！")
-    except Exception as exc:
-        logger.warning("⚠️ 预热页面提示: %s", exc)
+        await page_instance.goto(TRADOVATE_URL, wait_until="domcontentloaded", timeout=60000)
+    except Exception as e:
+        logger.warning(f"⚠️ 页面加载: {e}")
+
+    await page_instance.wait_for_timeout(3000)
+    await auto_fill_form()
+
+    # 等待用户完成登录
+    await wait_for_login_and_token(timeout_sec=300)
+
+    if _token_candidates:
+        logger.info(f"🔑 共捕获 {len(_token_candidates)} 个 Token，开始验证...")
+        await refresh_account_info()
+    else:
+        logger.error("❌ 未捕获到任何 Token")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global playwright_instance, browser_instance, context_instance
-    if context_instance:
-        await context_instance.close()
-    if browser_instance:
-        await browser_instance.close()
-    if playwright_instance:
-        await playwright_instance.stop()
+    for obj, name in [(context_instance, "context"), (browser_instance, "browser"), (playwright_instance, "playwright")]:
+        if obj:
+            try:
+                await obj.stop() if name == "playwright" else await obj.close()
+            except Exception:
+                pass
 
 
-# ================= 4. 辅助函数：定位 DOM & 提取 Token =================
-STORAGE_SNAPSHOT_JS = """() => {
-    const dump = (storage) => {
-        const out = {};
-        try {
-            for (let i = 0; i < storage.length; i++) {
-                const key = storage.key(i);
-                out[key] = storage.getItem(key);
-            }
-        } catch (e) {}
-        return out;
-    };
-    return { local: dump(localStorage), session: dump(sessionStorage) };
-}"""
+class OrderSignal(BaseModel):
+    action: str
+    symbol: Optional[str] = "MES"
+    qty: int = 1
+    order_type: str = "Market"
 
 
-async def _get_storage_snapshot() -> Dict[str, Any]:
-    """读取浏览器 localStorage / sessionStorage 全量快照（Token 提取与 /diagnose 共用）。"""
-    global page_instance
-    if not page_instance:
-        return {"local": {}, "session": {}}
+@app.post("/api/place-order")
+async def api_place_order(signal: OrderSignal):
+    action = signal.action.upper()
+    if action not in ["BUY", "SELL"]:
+        raise HTTPException(400, "只支持 BUY / SELL")
+
+    if not _account_info.get("accountId"):
+        await refresh_account_info()
+    if not _account_info.get("accountId"):
+        raise HTTPException(500, "账户未就绪，请检查 Token 是否有效")
+
+    symbol = (signal.symbol or "MES").upper().strip()
     try:
-        snapshot = await page_instance.evaluate(STORAGE_SNAPSHOT_JS)
-        if isinstance(snapshot, dict):
-            return snapshot
-    except Exception as exc:
-        logger.warning("读取浏览器存储失败: %s", exc)
-    return {"local": {}, "session": {}}
+        contract = await _api_call("GET", f"/contract/find?name={symbol}")
+    except HTTPException as e:
+        raise HTTPException(404, f"找不到合约 {symbol}: {e.detail}")
 
+    if not contract or not contract.get("id"):
+        raise HTTPException(404, f"合约 {symbol} 查询无结果")
 
-def _extract_token_from_storage(storage: Any) -> str:
-    """按优先级从单个 storage 快照中提取 Tradovate Token。"""
-    if not isinstance(storage, dict):
-        return ""
-
-    # 1) 首选：localStorage["token"] = {"token": "eyJ...", "expirationTime": "..."}
-    raw_token = storage.get("token")
-    if isinstance(raw_token, str) and raw_token.strip():
-        try:
-            parsed = json.loads(raw_token)
-        except (ValueError, TypeError):
-            return raw_token.strip()
-        if isinstance(parsed, dict):
-            for field in ("token", "accessToken", "auth_token"):
-                value = parsed.get(field)
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
-        elif isinstance(parsed, str) and parsed.strip():
-            return parsed.strip()
-
-    # 2) 依次尝试常见键名
-    for key in ("accessToken", "auth_token", "access_token"):
-        value = storage.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-
-    # 3) 兜底：扫描所有值，取 JSON 中的 token / accessToken 字段
-    for value in storage.values():
-        if not isinstance(value, str) or "token" not in value.lower():
-            continue
-        try:
-            parsed = json.loads(value)
-        except (ValueError, TypeError):
-            continue
-        if not isinstance(parsed, dict):
-            continue
-        for field in ("token", "accessToken", "auth_token"):
-            candidate = parsed.get(field)
-            if isinstance(candidate, str) and candidate.strip():
-                return candidate.strip()
-    return ""
-
-
-async def get_tradovate_token() -> str:
-    """从浏览器存储提取 API 访问 Token：localStorage["token"] → accessToken → auth_token → sessionStorage。"""
-    global page_instance
-    if not page_instance:
-        return ""
-
-    snapshot = await _get_storage_snapshot()
-
-    token = _extract_token_from_storage(snapshot.get("local"))
-    if token:
-        return token
-
-    token = _extract_token_from_storage(snapshot.get("session"))
-    if token:
-        logger.info("🔑 已在 sessionStorage 兜底路径中提取到 AccessToken")
-        return token
-
-    logger.warning("❌ 未能从 localStorage / sessionStorage 提取到 AccessToken（请重新运行 save_session.py 或检查 /diagnose）")
-    return ""
-
-
-async def get_symbol_container(symbol: str) -> Locator:
-    """定位指定品种的专属交易面板；找不到直接 404，禁止回退到全局页面误点其他品种。"""
-    global page_instance
-    if not page_instance:
-        raise HTTPException(status_code=500, detail="浏览器实例未就绪")
-
-    clean_symbol = (symbol or "").upper().strip()
-    if not clean_symbol:
-        raise HTTPException(status_code=400, detail="symbol 参数不能为空")
-
-    modules = page_instance.locator(SYMBOL_CONTAINER_SELECTOR.format(s=clean_symbol))
-    if await modules.count() > 0:
-        logger.info("🔍 已定位到品种 [%s] 的专属交易面板容器", clean_symbol)
-        return modules.first
-
-    raise HTTPException(
-        status_code=404,
-        detail="未找到品种 %s 的交易面板，请先在 Tradovate 中打开并连接该品种" % clean_symbol,
-    )
-
-
-def _describe_selectors(texts: Tuple[str, ...]) -> str:
-    return ", ".join(['button:has-text("%s")' % text for text in texts])
-
-
-async def _first_visible_locator(
-    scope: Union[Page, Locator],
-    texts: Tuple[str, ...],
-    wait_ms: int = BUTTON_WAIT_TIMEOUT_MS,
-) -> Tuple[Optional[str], Optional[Locator]]:
-    """依次尝试多个文案选择器，返回第一个可见按钮的 (文案, Locator)。"""
-    for text in texts:
-        selector = 'button:has-text("%s")' % text
-        try:
-            locator = scope.locator(selector)
-            if await locator.count() == 0:
-                continue  # 页面里根本不存在该文案 → 快速切换下一个，避免白等超时
-            candidate = locator.first
-            await candidate.wait_for(state="visible", timeout=wait_ms)
-            return text, candidate
-        except Exception:
-            continue
-    return None, None
-
-
-async def _click_first_visible(scope: Union[Page, Locator], texts: Tuple[str, ...], label: str) -> str:
-    """点击第一个可见按钮（兼容多种文案），全部不可用时返回 500。"""
-    matched_text, locator = await _first_visible_locator(scope, texts)
-    if locator is None:
-        raise HTTPException(
-            status_code=500,
-            detail="未找到可点击的%s按钮（已尝试：%s）" % (label, _describe_selectors(texts)),
-        )
-    await locator.click()
-    return matched_text
-
-
-async def _fill_order_qty(scope: Union[Page, Locator], qty: int) -> str:
-    """填写手数输入框；找不到输入框直接 500，绝不静默使用 Tradovate 默认手数。"""
-    qty_input = scope.locator(QTY_INPUT_SELECTOR).first
-    try:
-        await qty_input.wait_for(state="visible", timeout=BUTTON_WAIT_TIMEOUT_MS)
-    except Exception:
-        raise HTTPException(
-            status_code=500,
-            detail="未找到手数输入框（%s），已取消下单以免误用 Tradovate 默认手数" % QTY_INPUT_SELECTOR,
-        )
-
-    expected = str(int(qty))
-    try:
-        await qty_input.click()
-        await qty_input.fill(expected)
-        # 部分前端框架对 fill 不触发 onChange → 补发 input/change 事件，确保界面真的采纳该手数
-        await qty_input.evaluate(
-            "el => { el.dispatchEvent(new Event('input', {bubbles: true})); "
-            "el.dispatchEvent(new Event('change', {bubbles: true})); }"
-        )
-        actual = (await qty_input.input_value()).strip()
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail="填写手数失败: %s" % exc)
-
-    if actual != expected:
-        raise HTTPException(
-            status_code=500,
-            detail="手数填写失败：期望 %s，界面当前为 %s" % (expected, actual),
-        )
-    return actual
-
-
-def _position_fingerprint(positions: Any) -> Dict[str, int]:
-    """把持仓列表压缩成 {品种: 净持仓手数}，用于判断下单前后持仓是否变化。"""
-    fingerprint: Dict[str, int] = {}
-    if not isinstance(positions, list):
-        return fingerprint
-    for item in positions:
-        if not isinstance(item, dict):
-            continue
-        name = item.get("symbol") or item.get("name") or item.get("contractId") or "UNKNOWN"
-        raw_qty = item.get("netPos")
-        if raw_qty is None:
-            raw_qty = item.get("netPosition", item.get("quantity", item.get("position", 0)))
-        try:
-            qty_value = int(raw_qty)
-        except (TypeError, ValueError):
-            qty_value = 0
-        key = str(name).upper()
-        fingerprint[key] = fingerprint.get(key, 0) + qty_value
-    return fingerprint
-
-
-def _order_ids(orders: Any) -> List[str]:
-    """提取订单 ID 列表（用于判断是否出现新订单记录）。"""
-    ids: List[str] = []
-    if not isinstance(orders, list):
-        return ids
-    for item in orders:
-        if not isinstance(item, dict):
-            continue
-        order_id = item.get("id", item.get("orderId"))
-        if order_id is not None:
-            ids.append(str(order_id))
-    return ids
-
-
-async def _wait_for_order_confirmation(
-    symbol: str,
-    before_positions: Dict[str, int],
-    before_orders: List[str],
-) -> Dict[str, Any]:
-    """点击 Buy/Sell 后轮询 /account-summary（最多 ORDER_CONFIRM_TIMEOUT 秒），确认持仓变化或新订单。"""
-    deadline = time.monotonic() + ORDER_CONFIRM_TIMEOUT
-    last_error = ""
-
-    while True:
-        await asyncio.sleep(ORDER_CONFIRM_INTERVAL)
-        try:
-            summary = await get_account_summary()
-            after_positions = _position_fingerprint(summary.get("positions"))
-            after_orders = _order_ids(summary.get("orders"))
-
-            if after_positions != before_positions:
-                return {"reason": "持仓已变化", "positions": after_positions, "orders_count": len(after_orders)}
-
-            new_orders = [order_id for order_id in after_orders if order_id not in before_orders]
-            if new_orders:
-                return {
-                    "reason": "订单列表出现新记录（%s）" % ", ".join(new_orders[:3]),
-                    "positions": after_positions,
-                    "orders_count": len(after_orders),
-                }
-            last_error = ""
-        except HTTPException as exc:
-            last_error = str(exc.detail)
-        except Exception as exc:
-            last_error = str(exc)
-
-        if time.monotonic() >= deadline:
-            break
-
-    detail = (
-        "已点击 %s 的下单按钮，但 %.0f 秒内未确认到持仓变化或新订单"
-        "（可能未成交、品种面板未连接或 Tradovate 页面状态异常）"
-        % (symbol, ORDER_CONFIRM_TIMEOUT)
-    )
-    if last_error:
-        detail += "；最近一次查询错误: %s" % last_error
-    raise HTTPException(status_code=500, detail=detail)
-
-
-async def _click_order_button(scope: Union[Page, Locator], action: str, symbol: str, qty: int) -> Dict[str, Any]:
-    """点击 Buy/Sell 发单：先写手数 → 兼容选择器点击 → 轮询确认，未确认成功则 500。"""
-    button_texts = BUY_BUTTON_TEXTS if action == "BUY" else SELL_BUTTON_TEXTS
-    action_label = "Buy" if action == "BUY" else "Sell"
-
-    # 1) 点击前取基线快照（确认阶段用于对比持仓 / 订单）
-    before = await get_account_summary()
-    before_positions = _position_fingerprint(before.get("positions"))
-    before_orders = _order_ids(before.get("orders"))
-
-    # 2) 手数必须先写入界面，禁止使用 Tradovate 默认手数
-    filled_qty = await _fill_order_qty(scope, qty)
-
-    # 3) 依次尝试兼容选择器，点击第一个可见按钮
-    matched_text = await _click_first_visible(scope, button_texts, action_label)
-    logger.info(
-        "🎯 [已发单] 品种 [%s] 点击【%s】(action=%s, qty=%s)，等待成交确认…",
-        symbol, matched_text, action, filled_qty,
-    )
-
-    # 4) 轮询确认：只有持仓变化或出现新订单才算成功
-    confirmation = await _wait_for_order_confirmation(symbol, before_positions, before_orders)
-    return {
-        "status": "success",
-        "action": action,
-        "symbol": symbol,
-        "qty": int(qty),
-        "button": matched_text,
-        "confirmed_by": confirmation["reason"],
-        "positions_before": before_positions,
-        "positions_after": confirmation["positions"],
-        "orders_before": len(before_orders),
-        "orders_after": confirmation["orders_count"],
+    payload = {
+        "action": "Buy" if action == "BUY" else "Sell",
+        "symbol": contract.get("name", symbol),
+        "orderQty": signal.qty,
+        "orderType": signal.order_type or "Market",
+        "accountSpec": _account_info["accountSpec"],
+        "accountId": _account_info["accountId"],
+        "isAutomated": True,
     }
 
+    logger.info(f"📤 [下单] {payload}")
+    result = await _api_call("POST", "/order/placeOrder", payload)
 
-# ================= 5. API 路由定义 =================
-@app.post("/webhook")
-async def handle_webhook(signal: OrderSignal):
-    """
-    【统一 Webhook 接口】通过 DOM 仿真点击发单（前端 http://localhost:5173 跨域直接调用）
-    - BUY / SELL:  填写手数 → 点击 Buy/Sell → 轮询确认持仓 / 订单变化，未确认成功返回 500
-    - CANCEL_ALL:  撤销指定品种所有挂单
-    - FLATTEN:     指定品种一键平仓并全撤
-    """
-    global page_instance, lock
-    action = (signal.action or "").upper().strip()
-    symbol = (signal.symbol or "MES").upper().strip()
+    reason = result.get("failureReason") or result.get("failureText")
+    if reason and reason != "Success":
+        raise HTTPException(400, f"下单被拒: {reason}")
 
-    if action not in ("BUY", "SELL", "CANCEL_ALL", "FLATTEN"):
-        raise HTTPException(status_code=400, detail="Action 参数无效")
-    if action in ("BUY", "SELL") and (signal.qty is None or int(signal.qty) <= 0):
-        raise HTTPException(status_code=400, detail="qty 必须为正整数")
-
-    async with lock:
-        if not page_instance:
-            raise HTTPException(status_code=500, detail="浏览器实例未就绪")
-
-        try:
-            scope = await get_symbol_container(symbol)
-
-            if action == "CANCEL_ALL":
-                matched_text = await _click_first_visible(scope, CANCEL_BUTTON_TEXTS, "Cancel All")
-                logger.info("🛑 [撤单成功] 已点击【%s】取消品种 [%s] 的所有挂单", matched_text, symbol)
-                return {
-                    "status": "success",
-                    "action": "CANCEL_ALL",
-                    "symbol": symbol,
-                    "button": matched_text,
-                    "message": "已取消 %s 所有挂单" % symbol,
-                }
-
-            if action == "FLATTEN":
-                matched_text = await _click_first_visible(scope, FLATTEN_BUTTON_TEXTS, "Flatten")
-                logger.info("💥 [紧急平仓] 已点击【%s】平仓并撤销品种 [%s] 的所有头寸", matched_text, symbol)
-                return {
-                    "status": "success",
-                    "action": "FLATTEN",
-                    "symbol": symbol,
-                    "button": matched_text,
-                    "message": "已一键平仓并全撤 %s" % symbol,
-                }
-
-            result = await _click_order_button(scope, action, symbol, int(signal.qty))
-            logger.info(
-                "🎯 [发单成功] %s %s × %s（确认依据：%s）",
-                action, symbol, result["qty"], result["confirmed_by"],
-            )
-            return result
-
-        except HTTPException:
-            raise  # 404「未找到品种交易面板」/ 400 / 500 等业务异常原样返回
-        except Exception as exc:
-            logger.exception("❌ [操作异常] 执行 %s 的 %s 指令失败", symbol, action)
-            raise HTTPException(status_code=500, detail="执行 %s 的 %s 指令失败: %s" % (symbol, action, exc))
+    order_id = result.get("orderId")
+    logger.info(f"✅ [下单成功] orderId={order_id}")
+    return {"status": "success", "orderId": order_id, "symbol": symbol, "action": action, "qty": signal.qty}
 
 
-@app.post("/cancel-all")
-async def cancel_all_orders(symbol: Optional[str] = "MES"):
-    """【指定品种撤单端点】"""
-    return await handle_webhook(OrderSignal(action="CANCEL_ALL", symbol=symbol))
-
-
-@app.post("/flatten")
-async def flatten_positions(symbol: Optional[str] = "MES"):
-    """【指定品种平仓全撤端点】"""
-    return await handle_webhook(OrderSignal(action="FLATTEN", symbol=symbol))
-
-
-# ================= 6. 方案 B：REST API 持仓与资金查询接口 =================
 @app.get("/account-summary")
 async def get_account_summary():
-    """
-    【方案 B】提取会话 Token 并直接请求 Tradovate REST API，
-    高精度获取账户列表、实时资金/余额、当前所有持仓与订单（下单确认的判定依据）。
-    """
-    token = await get_tradovate_token()
-    if not token:
-        raise HTTPException(status_code=401, detail="无法从当前浏览器 Session 中提取到有效 AccessToken，请重新获取 state.json")
-
-    headers = {
-        "Authorization": "Bearer %s" % token,
-        "Accept": "application/json",
+    return {
+        "status": "success",
+        "accounts": await _api_call("GET", "/account/list"),
+        "positions": await _api_call("GET", "/position/list"),
+        "cash_balances": await _api_call("GET", "/cashBalance/list"),
     }
 
-    async with httpx.AsyncClient() as client:
-        try:
-            # 1) 账户列表 2) 持仓列表 3) 资金明细 4) 订单列表（下单确认用）
-            accounts_res = await client.get("%s/account/list" % TRADOVATE_API_BASE, headers=headers)
-            positions_res = await client.get("%s/position/list" % TRADOVATE_API_BASE, headers=headers)
-            cash_res = await client.get("%s/cashBalance/list" % TRADOVATE_API_BASE, headers=headers)
-            orders_res = await client.get("%s/order/list" % TRADOVATE_API_BASE, headers=headers)
 
-            return {
-                "status": "success",
-                "source": "REST_API_DIRECT",
-                "environment": describe_environment(),
-                "accounts": accounts_res.json() if accounts_res.status_code == 200 else [],
-                "positions": positions_res.json() if positions_res.status_code == 200 else [],
-                "cash_balances": cash_res.json() if cash_res.status_code == 200 else [],
-                "orders": orders_res.json() if orders_res.status_code == 200 else [],
-            }
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail="REST API 查询异常: %s" % exc)
+@app.get("/orders")
+async def get_orders():
+    return {"status": "success", "orders": await _api_call("GET", "/order/list")}
 
 
-@app.get("/positions")
-async def get_positions():
-    """多级降级持仓查询接口（优先 API，其次 DOM/网络拦截）"""
-    try:
-        return await get_account_summary()
-    except HTTPException:
-        # API 失败（Token 缺失 / 网络异常）时降级回 DOM 与被动缓存
-        global page_instance, latest_positions_cache
-        if not page_instance:
-            raise HTTPException(status_code=500, detail="浏览器未就绪")
-
-        positions = []
-        rows = page_instance.locator('.position-row, tr[data-position-id]')
-        count = await rows.count()
-
-        if count > 0:
-            for i in range(count):
-                row_text = await rows.nth(i).inner_text()
-                parsed_text = [item.strip() for item in row_text.split("\n") if item.strip()]
-                positions.append({"row_index": i, "details": parsed_text})
-            return {"status": "success", "source": "DOM_FALLBACK", "positions": positions}
-
-        return {"status": "success", "source": "CACHE_FALLBACK", "positions": latest_positions_cache.get("data", [])}
+@app.get("/account-info")
+async def get_account_info():
+    return {"status": "success", "account": _account_info}
 
 
 @app.get("/health")
@@ -634,48 +322,41 @@ async def health_check():
     return {
         "status": "ok",
         "browser_active": page_instance is not None,
-        "environment": describe_environment(),
-        "tradovate_api_base": TRADOVATE_API_BASE,
-        "port": PORT,
+        "tokens_captured": len(_token_candidates),
+        "current_token_len": len(_current_token),
+        "account_ready": bool(_account_info.get("accountId")),
+        "env": "live" if "live" in TRADOVATE_API_BASE else "demo",
     }
 
 
 @app.get("/diagnose")
 async def diagnose():
-    """【诊断接口】Token 长度、localStorage 键、Buy/Sell 按钮可用性、当前页面 URL。"""
-    global page_instance, latest_positions_cache, latest_orders_cache
-    if not page_instance:
-        raise HTTPException(status_code=500, detail="浏览器实例未就绪")
-
-    snapshot = await _get_storage_snapshot()
-    local_storage = snapshot.get("local") or {}
-    session_storage = snapshot.get("session") or {}
-    token = await get_tradovate_token()
-
-    buy_text, buy_locator = await _first_visible_locator(page_instance, BUY_BUTTON_TEXTS, wait_ms=1000)
-    sell_text, sell_locator = await _first_visible_locator(page_instance, SELL_BUTTON_TEXTS, wait_ms=1000)
-
-    return {
-        "status": "success",
-        "current_url": page_instance.url,
-        "environment": describe_environment(),
-        "tradovate_api_base": TRADOVATE_API_BASE,
-        "token_len": len(token),
-        "token_preview": ("%s…" % token[:12]) if token else "",
-        "localStorage_keys": sorted(local_storage.keys()),
-        "sessionStorage_keys": sorted(session_storage.keys()),
-        "has_buy_button": buy_locator is not None,
-        "has_sell_button": sell_locator is not None,
-        "buy_button_text": buy_text,
-        "sell_button_text": sell_text,
-        "cached_positions_count": len(latest_positions_cache.get("data") or []),
-        "cached_orders_count": len(latest_orders_cache.get("data") or []),
+    result = {
+        "browser": page_instance is not None,
+        "tokens_count": len(_token_candidates),
+        "token_lengths": [len(t) for t in _token_candidates],
+        "current_token_len": len(_current_token),
+        "account_info": _account_info,
     }
+    if page_instance:
+        try:
+            result["url"] = page_instance.url
+        except Exception:
+            pass
+
+    if _token_candidates:
+        try:
+            accounts = await _api_call("GET", "/account/list")
+            result["api_test"] = f"OK ({len(accounts)} accounts)"
+        except Exception as e:
+            result["api_test"] = f"FAIL: {e}"
+    else:
+        result["api_test"] = "SKIP (no token)"
+
+    return result
 
 
 if __name__ == "__main__":
     import uvicorn
-
-    logger.info("⚡ 服务已开启，监听端口: %s | 当前环境: %s | API: %s", PORT, describe_environment(), TRADOVATE_API_BASE)
-    logger.info("🌐 CORS 允许来源: %s", ", ".join(CORS_ORIGINS))
-    uvicorn.run(app, host="0.0.0.0", port=PORT, reload=False)
+    logger.info(f"⚡ 监听端口: {PORT}")
+    uvicorn.run("app:app", host="0.0.0.0", port=PORT, reload=False)
