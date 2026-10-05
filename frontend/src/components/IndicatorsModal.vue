@@ -11,6 +11,7 @@ const searchRef = ref<HTMLInputElement | null>(null)
 
 const INDICATORS = [
   { key: 'ema', symbol: 'EMA', name: 'Exponential Moving Average', cn: '指数移动平均线' },
+  { key: 'h2l2', symbol: 'H2/L2', name: 'High 2 / Low 2', cn: '高二低二（EMA 二次突破回调）' },
 ]
 
 const filtered = computed(() => {
@@ -45,9 +46,26 @@ watch(
 )
 onBeforeUnmount(() => window.removeEventListener('keydown', onWindowKeydown))
 
-/** 点击指标项 → 实例化添加（弹窗保持打开，支持连续添加多实例）。 */
+/** 点击指标项：EMA 实例化添加（弹窗保持打开，支持连续添加多实例）；H2/L2 为单开关，点击即切换。 */
 function pick(item: { key: string }) {
   if (item.key === 'ema') indicator.addEMA(20)
+  else if (item.key === 'h2l2') indicator.toggleH2L2()
+}
+
+/** H2/L2 勾选框：与点击整行共用同一开关（传目标值避免双向取反歧义）。 */
+function onToggleH2L2(checked: boolean) {
+  indicator.toggleH2L2(checked)
+}
+
+/** EMA 周期输入：非法值直接忽略，由 store 夹取到 1~500。 */
+function onPeriodInput(value: string) {
+  const n = parseInt(value, 10)
+  if (Number.isFinite(n)) indicator.updateH2L2({ emaPeriod: n })
+}
+
+/** 邮件提醒开关。 */
+function onEmailToggle(checked: boolean) {
+  indicator.updateH2L2({ emailNotify: checked })
 }
 </script>
 
@@ -62,13 +80,46 @@ function pick(item: { key: string }) {
         <button class="ind-close" title="关闭 (Esc)" @click="emit('close')">✕</button>
       </header>
       <ul class="ind-list">
-        <li v-for="i in filtered" :key="i.key" class="ind-item" @click="pick(i)">
-          <span class="ind-symbol">{{ i.symbol }}</span>
-          <span class="ind-name">
-            <b>{{ i.name }}</b>
-            <em>{{ i.cn }}</em>
-          </span>
-          <span class="ind-add" title="添加到图表">＋</span>
+        <li v-for="i in filtered" :key="i.key" class="ind-row">
+          <div class="ind-item" @click="pick(i)">
+            <span class="ind-symbol">{{ i.symbol }}</span>
+            <span class="ind-name">
+              <b>{{ i.name }}</b>
+              <em>{{ i.cn }}</em>
+            </span>
+            <!-- H2/L2：勾选框直接绑定 indicatorStore.h2l2.enabled（@click.stop 防止整行点击重复切换） -->
+            <label v-if="i.key === 'h2l2'" class="ind-check" title="显示 / 隐藏 H2/L2 标记" @click.stop>
+              <input
+                type="checkbox"
+                :checked="indicator.h2l2.enabled"
+                @change="onToggleH2L2(($event.target as HTMLInputElement).checked)"
+              />
+              <span>{{ indicator.h2l2.enabled ? '已开启' : '已关闭' }}</span>
+            </label>
+            <span v-else class="ind-add" title="添加到图表">＋</span>
+          </div>
+          <!-- H2/L2 开启后展开：EMA 周期 + 邮件提醒 -->
+          <div v-if="i.key === 'h2l2' && indicator.h2l2.enabled" class="ind-sub" @click.stop>
+            <label class="ind-sub-field">
+              <span>EMA 周期</span>
+              <input
+                class="ind-sub-input"
+                type="number"
+                min="1"
+                max="500"
+                :value="indicator.h2l2.emaPeriod"
+                @input="onPeriodInput(($event.target as HTMLInputElement).value)"
+              />
+            </label>
+            <label class="ind-sub-check">
+              <input
+                type="checkbox"
+                :checked="indicator.h2l2.emailNotify"
+                @change="onEmailToggle(($event.target as HTMLInputElement).checked)"
+              />
+              <span>命中 H2/L2 时邮件提醒</span>
+            </label>
+          </div>
         </li>
       </ul>
       <footer v-if="!filtered.length" class="ind-empty">无匹配指标</footer>
@@ -158,6 +209,9 @@ function pick(item: { key: string }) {
   padding: 6px;
   overflow-y: auto;
 }
+.ind-row {
+  list-style: none;
+}
 .ind-item {
   display: flex;
   align-items: center;
@@ -204,6 +258,61 @@ function pick(item: { key: string }) {
   font-size: 15px;
   color: #556070;
   flex-shrink: 0;
+}
+/* H2/L2 开关勾选框 */
+.ind-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  font-size: 11px;
+  color: #8090a5;
+  cursor: pointer;
+}
+.ind-check input,
+.ind-sub-check input {
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  accent-color: #3b82f6;
+  cursor: pointer;
+}
+/* H2/L2 参数区（EMA 周期 + 邮件提醒） */
+.ind-sub {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 0 10px 9px 10px;
+}
+.ind-sub-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: #8090a5;
+}
+.ind-sub-input {
+  width: 60px;
+  height: 24px;
+  padding: 0 6px;
+  background: var(--color-bg-primary, #12161c);
+  color: var(--color-text, #e8edf3);
+  border: 1px solid var(--color-border, #1e293b);
+  border-radius: 4px;
+  font-size: 11px;
+  outline: none;
+}
+.ind-sub-input:focus {
+  border-color: #3b82f6;
+}
+.ind-sub-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: #8090a5;
+  cursor: pointer;
 }
 .ind-empty {
   padding: 14px;

@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   createChart,
+  createSeriesMarkers,
   ColorType,
   CrosshairMode,
   CandlestickSeries,
@@ -10,6 +11,7 @@ import {
   TickMarkType,
   type IChartApi,
   type ISeriesApi,
+  type ISeriesMarkersPluginApi,
   type LineData,
   type LineWidth,
   type LogicalRange,
@@ -24,8 +26,10 @@ import EMASettingsModal from './EMASettingsModal.vue'
 import { useCountdown } from '../composables/useCountdown'
 import { useIndicatorStore } from '../stores/indicatorStore'
 import { useTradingStore } from '../stores/tradingStore'
+import { createH2L2Engine, toEmaLineData, toSeriesMarkers } from '../services/h2l2Signals'
+import { sendSignalAlert } from '../services/alertService'
 import { calculateEMA } from '../utils/indicators'
-import { normalizeKlines, toKlineSeconds } from '../utils/klineSeries'
+import { alignKlineToInterval, normalizeKlines, toKlineSeconds } from '../utils/klineSeries'
 import { formatBeijingDateTime, formatBeijingShort, timeLikeToEpochSec } from '../utils/beijingTime'
 import { POINT_COUNT, randomColor, DEFAULT_FIB_LEVELS, type DrawKind, type DrawObject, type DrawPoint } from '../types/drawing'
 import type { Interval } from '../types'
@@ -108,6 +112,11 @@ let volumeSeries: ISeriesApi<'Histogram'> | null = null
 let primitive: DrawingPrimitive | null = null
 let countdownPrimitive: CandleCountdownPrimitive | null = null
 let positionPrimitive: PositionLinePrimitive | null = null
+/**
+ * H2/L2 标记层。lightweight-charts v5 已移除 `series.setMarkers()`，
+ * 官方替代为 `createSeriesMarkers(series, markers)` 返回的插件对象（`.setMarkers()` / `.detach()`）。
+ */
+let seriesMarkers: ISeriesMarkersPluginApi<Time> | null = null
 
 // ---------- 画线交互状态（FSM: idle → placing → selected/dragging） ----------
 const mode = ref<'idle' | 'placing' | 'dragging' | 'bracket-drag'>('idle')
@@ -394,6 +403,9 @@ onMounted(async () => {
   })
   chart.priceScale('volume').applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } })
 
+  // H2/L2 标记层（v5 插件：等价于旧版 series.setMarkers()）
+  seriesMarkers = createSeriesMarkers(candleSeries, [])
+
   primitive = new DrawingPrimitive()
   candleSeries.attachPrimitive(primitive)
   primitive.setKlines(props.data)
@@ -445,6 +457,8 @@ onBeforeUnmount(() => {
     chart.timeScale().unsubscribeVisibleLogicalRangeChange(onVisibleLogicalRangeChange)
     if (clickHandler) chart.unsubscribeClick(clickHandler)
     if (crosshairHandler) chart.unsubscribeCrosshairMove(crosshairHandler)
+    // H2/L2 标记插件随 series 显式卸载（chart.remove() 也会清理，这里做显式生命周期收尾）
+    seriesMarkers?.detach()
     chart.remove()
     chart = null
   }
@@ -457,6 +471,9 @@ onBeforeUnmount(() => {
   volumeSeries = null
   primitive = null
   positionPrimitive = null
+  seriesMarkers = null
+  h2l2EmaSeries = null
+  h2l2EmaTail = null
 })
 
 function handleResize() {
@@ -487,6 +504,10 @@ function fullRefresh() {
     autoFitChart()
   }
   syncEmaSeries()
+  syncH2L2(bars)
+  // 与自定义 EMA 折线保持一致：加载完成后立即把 H2/L2 的 EMA 延伸到当前未收盘 Bar
+  // （否则折线会停在最后一根已收盘 Bar，需等到下一次 tick 才补齐）
+  if (bars.length) syncH2L2EmaTail(bars[bars.length - 1])
 }
 
 /**
@@ -524,6 +545,8 @@ function applyRealtimeTick() {
       fullRefresh()
       return
     }
+    // 换线判定：尾部新增一根（len = lastLen + 1）即表示「上一根刚刚收盘」→ 其 OHLC 已定稿
+    const barClosed = len > lastLen
     candleSeries.update(toCandle(last))
     volumeSeries.update(toVolume(last))
     lastLen = len
@@ -533,6 +556,10 @@ function applyRealtimeTick() {
     countdownPrimitive?.setValue(toNumber(last.close), countdown.value)
     syncPositionOverlay()
     syncEmaTail(last)
+    // H2/L2：换线（尾部新增一根）说明上一根已收盘 → 只喂它做增量计算，命中信号则补标记 + 邮件提醒
+    if (barClosed) onBarClosed(bars[len - 2])
+    // H2/L2 的 EMA 折线随 tick 延伸到未收盘 Bar（纯展示，不参与信号判定）
+    syncH2L2EmaTail(last)
   } catch (err) {
     // 任何异常都不得卡住渲染：降级为全量重绘
     console.warn('[TradingChart] 实时增量渲染失败，回退全量重绘', err)
@@ -572,6 +599,8 @@ function resetChartContext(clearDrawings: boolean) {
   for (const s of emaSeriesMap.values()) s.setData([])
   emaTailMap.clear()
   emaLastValues.value = {}
+  // 3.1) H2/L2：旧标的标记 / EMA 折线 / 引擎状态一并失效（新数据到达后由 syncH2L2 重建）
+  clearH2L2()
   // 4) 价格轴恢复自动缩放（用户对旧标的手动拖动/缩放不带到新标的）
   chart.priceScale('right').applyOptions({ autoScale: true })
   chart.priceScale('volume').applyOptions({ autoScale: true })
@@ -762,11 +791,169 @@ function fmtEmaValue(v: number | null | undefined): string {
     : v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 }
 
+// ---------- H2 / L2 指标（EMA 二次突破回调：标记 + EMA 折线 + 邮件提醒） ----------
+/**
+ * 增量引擎，计算逻辑来自 `indicators/H2L2Indicator.ts`（`H2L2Tracker` / `calculateH2L2All`）。
+ * 只喂「已收盘」的 K 线：tracker 内部有 prevEMA / trend / count 等状态，
+ * 对同一根尚未收盘的 Bar 重复调用会把 count 多次累加（同一根重复出信号）。
+ */
+let h2l2 = createH2L2Engine(20)
+/** 当前引擎固化的 EMA 周期：与面板 `h2l2.emaPeriod` 不一致时整体重建引擎。 */
+let h2l2Period = 20
+/** H2/L2 的 EMA 折线系列（独立于用户自定义 EMA 实例，金色以示区分）。 */
+let h2l2EmaSeries: ISeriesApi<'Line'> | null = null
+/** EMA 折线尾部缓存：tick 级 O(1) 递推（与 syncEmaTail 同一套算法）。 */
+let h2l2EmaTail: { time: number; value: number; prev: number | null } | null = null
+/** 图例显示的 EMA 最新值。 */
+const h2l2EmaLast = ref<number | null>(null)
+/** H2/L2 折线配色（金色，与用户 EMA 调色板区分）。 */
+const H2L2_EMA_COLOR = '#f0b90b'
+
+/** 关闭 / 重置：清空标记、移除 EMA 折线、重置引擎与图例数值。 */
+function clearH2L2() {
+  seriesMarkers?.setMarkers([])
+  if (chart && h2l2EmaSeries) chart.removeSeries(h2l2EmaSeries)
+  h2l2EmaSeries = null
+  h2l2EmaTail = null
+  h2l2EmaLast.value = null
+  h2l2.reset([])
+}
+
+/**
+ * 与面板配置 / K 线数据同步（整表级）。
+ * - 未勾选：立即清空标记并移除 EMA 折线（不做法计算）；
+ * - 已勾选：全量扫描历史（`calculateH2L2All`）→ 一次性重设全部标记 + 重绘 EMA 折线。
+ * 触发时机：首次加载 / 切换标的·周期（数据到达后）/ 面板勾选 / 周期变更。
+ *
+ * ⚠️ 喂给引擎的必须是**图表真正渲染的那份数据**（`normalizeKlines`：时间对齐周期网格 + 去重 + 升序 + 剔除非法行）。
+ * 若喂原始 `props.data`，未按周期网格对齐的数据源（典型：IBKR 4h）会出现
+ * 「算出了信号但标记时间不在时间轴上」→ 标记静默不显示。`fullRefresh()` 传入已归一化的 `bars` 以避免重复计算。
+ */
+function syncH2L2(source?: readonly Kline[]) {
+  if (disposed || !chart) return
+  const cfg = indicator.h2l2
+  if (!cfg.enabled) {
+    clearH2L2()
+    return
+  }
+  // 周期变更：引擎把 period 固化在闭包里，必须重建；折线数据与尾部缓存一并作废
+  if (h2l2Period !== cfg.emaPeriod) {
+    h2l2 = createH2L2Engine(cfg.emaPeriod)
+    h2l2Period = cfg.emaPeriod
+    if (h2l2EmaSeries) {
+      chart.removeSeries(h2l2EmaSeries)
+      h2l2EmaSeries = null
+    }
+    h2l2EmaTail = null
+  }
+  h2l2.reset(source ?? normalizeKlines(props.data, props.interval))
+  seriesMarkers?.setMarkers(toSeriesMarkers(h2l2.signals()))
+  syncH2L2EmaSeries()
+}
+
+/** 整表重绘 H2/L2 的 EMA 折线（历史加载 / 收盘确认后调用，非 tick 级）。 */
+function syncH2L2EmaSeries() {
+  if (!chart) return
+  let series = h2l2EmaSeries
+  if (!series) {
+    series = chart.addSeries(LineSeries, {
+      color: H2L2_EMA_COLOR,
+      lineWidth: 1 as LineWidth,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      crosshairMarkerVisible: false,
+      priceScaleId: 'right', // 叠加在 K 线同一价格轴 / 同一 Pane
+    })
+    h2l2EmaSeries = series
+  }
+  const points = h2l2.emaPoints()
+  series.setData(toEmaLineData(points))
+  // 记录尾部两点：tick 增量递推需要 EMA[i-1]（prev）与当前末点（value）
+  const count = points.length
+  if (count > 0) {
+    h2l2EmaTail = {
+      time: points[count - 1].time,
+      value: points[count - 1].value,
+      prev: count >= 2 ? points[count - 2].value : null,
+    }
+    h2l2EmaLast.value = points[count - 1].value
+  } else {
+    h2l2EmaTail = null
+    h2l2EmaLast.value = null
+  }
+}
+
+/**
+ * tick 级增量延伸 EMA 折线（O(1)）：EMA_today = Close·k + EMA_yesterday·(1−k)。
+ * - 同周期 tick：用 `tail.prev` 重算末点并 `series.update()`；
+ * - 换线（时间更大）：以 `tail.value` 为前值追加新点，折线随换线即时延伸。
+ * 未收盘 Bar 的 EMA 仅作展示；该根收盘后由 `syncH2L2EmaSeries()` 用权威值覆盖。
+ */
+function syncH2L2EmaTail(bar: Kline) {
+  const series = h2l2EmaSeries
+  const tail = h2l2EmaTail
+  if (!indicator.h2l2.enabled || !series || !tail) return
+  // 与图表渲染的时间轴保持一致：按周期网格对齐后再递推（未对齐数据源否则会插到错误的时间点）
+  const aligned = alignKlineToInterval(bar, props.interval)
+  const time = toKlineSeconds(aligned.time)
+  const close = toNumber(aligned.close)
+  if (!time || !(close > 0)) return
+  const k = 2 / (h2l2Period + 1)
+  let latest: number
+  if (time === tail.time) {
+    const value = tail.prev == null ? close : close * k + tail.prev * (1 - k)
+    series.update({ time: time as UTCTimestamp, value })
+    tail.value = value
+    latest = value
+  } else if (time > tail.time) {
+    const value = close * k + tail.value * (1 - k)
+    series.update({ time: time as UTCTimestamp, value })
+    h2l2EmaTail = { time, value, prev: tail.value }
+    latest = value
+  } else {
+    return
+  }
+  h2l2EmaLast.value = latest
+}
+
+/**
+ * 一根 K 线收盘时调用（`bars[len-2]`，其 OHLC 已定稿）。
+ * 命中 H2/L2 → 追加图表标记 + 触发邮件提醒；
+ * 同根 Bar 的重复调用已在引擎（同一 time 只喂一次）与 alertService（同键静默窗口）双重去重。
+ */
+function onBarClosed(bar: Kline | undefined) {
+  if (disposed || !indicator.h2l2.enabled || !bar) return
+  // 与历史播种 / 图表渲染同一份对齐规则：时间对齐周期网格后再喂引擎，避免与 reset() 的序列错位
+  const signal = h2l2.pushClosedBar(alignKlineToInterval(bar, props.interval))
+  if (!signal) return
+  seriesMarkers?.setMarkers(toSeriesMarkers(h2l2.signals()))
+  // 该根已定稿：用收盘后的权威 EMA 覆盖未收盘期间推算的临时值
+  syncH2L2EmaSeries()
+  // fire-and-forget：提醒失败不影响图表（面板「邮件提醒」未勾选 / 后端未提供该接口时只提示）
+  void sendSignalAlert(
+    {
+      symbol: (props.symbol ?? '').toUpperCase(),
+      timeframe: props.interval,
+      signalType: signal.type,
+      price: signal.price,
+      timestamp: signal.time,
+    },
+    { enabled: indicator.h2l2.emailNotify },
+  )
+}
+
 // 指标实例变化（增删 / 改色 / 改长度）→ 重算 EMA（deep 仅覆盖指标实例数组，不涉及 K 线大盘数组）
 watch(
   () => indicator.emaInstances,
   () => { if (!disposed) syncEmaSeries() },
   { deep: true },
+)
+
+// H2/L2 勾选 / EMA 周期变化 → 重算标记与折线
+// （`emailNotify` 不影响绘制，发送时实时读取，故不列入依赖）
+watch(
+  () => [indicator.h2l2.enabled, indicator.h2l2.emaPeriod],
+  () => { if (!disposed) syncH2L2() },
 )
 
 /**
@@ -1228,8 +1415,19 @@ function genId(): string {
 
 <template>
   <div ref="container" class="tv-chart" :style="{ cursor: containerCursor }">
-    <!-- 左上角指标图例 -->
-    <div v-if="indicator.emaInstances.length" class="ema-legend" @mousedown.stop.prevent @dblclick.stop>
+    <!-- 左上角指标图例（自定义 EMA 实例 + H2/L2） -->
+    <div
+      v-if="indicator.emaInstances.length || indicator.h2l2.enabled"
+      class="ema-legend"
+      @mousedown.stop.prevent
+      @dblclick.stop
+    >
+      <div v-if="indicator.h2l2.enabled" class="ema-legend-row">
+        <span class="ema-legend-name" :style="{ color: H2L2_EMA_COLOR }">
+          H2/L2 EMA{{ indicator.h2l2.emaPeriod }}<em>{{ fmtEmaValue(h2l2EmaLast) }}</em>
+        </span>
+        <button class="ema-legend-btn" title="隐藏 H2/L2 指标" @click="indicator.toggleH2L2(false)">👁</button>
+      </div>
       <div v-for="inst in indicator.emaInstances" :key="inst.id" class="ema-legend-row">
         <span class="ema-legend-name" :style="{ color: inst.color }">
           EMA {{ inst.length }}<em>{{ fmtEmaValue(emaLastValues[inst.id]) }}</em>
