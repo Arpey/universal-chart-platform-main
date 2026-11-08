@@ -19,3 +19,4 @@ src/**/*.js.js
 test_tradovate.py
 pushOrder/state.json
 pushOrder/__pycache__/app.cpython-37.pyc
+pushOrder/__pycache__/app.cpython-310.pyc
